@@ -1,0 +1,30 @@
+/* UI 层面设计令牌 (Application Chrome) */
+:root {
+  --ui-bg: #f7f7f7;
+  --ui-panel: #f1f1f1;
+  --ui-panel-hover: #e8e8e8;
+  --ui-panel-active: #ffffff;
+  --ui-border: #e1e1e1;
+  --ui-text: #333333;
+  --ui-text-muted: #858585;
+  --ui-accent: #4f78c4;
+  --ui-focus-ring: rgba(79, 120, 196, 0.3);
+  --ui-shadow-popover: 0 6px 18px rgba(0, 0, 0, 0.11), 0 0 0 1px rgba(0, 0, 0, 0.045);
+
+  --font-ui: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-content: "Source Serif 4", "Noto Serif SC", "Source Han Serif SC", "Songti SC", serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+}
+
+[data-theme="dark"] {
+  --ui-bg: #202020;
+  --ui-panel: #252525;
+  --ui-panel-hover: #2f2f2f;
+  --ui-panel-active: #1f1f1f;
+  --ui-border: #363636;
+  --ui-text: #d8d8d8;
+  --ui-text-muted: #8f8f8f;
+  --ui-accent: #6e9eea;
+  --ui-focus-ring: rgba(110, 158, 234, 0.3);
+  --ui-shadow-popover: 0 4px 12px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.05);
+}

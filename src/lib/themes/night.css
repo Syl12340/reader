@@ -1,0 +1,54 @@
+/*
+ * Night 深邃暗色主题
+ * 高对比度暗色，适合长时间夜间阅读
+ */
+[data-theme-preset="night"] {
+  --font-content: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', sans-serif;
+  --doc-bg: #0f0f0f;
+  --doc-text: #f0f0f0;
+  --doc-text-muted: #a0a0a0;
+  --doc-link: #60a5fa;
+  --doc-code-bg: #1a1a1a;
+  --doc-code-text: #f472b6;
+  --doc-quote-border: #333333;
+  --doc-table-border: #2a2a2a;
+  --doc-font-size: 16px;
+  --doc-line-height: 1.7;
+}
+
+/* Night 排版细节 */
+[data-theme-preset="night"] .markdown-body {
+  font-size: 16px;
+  line-height: 1.7;
+}
+
+[data-theme-preset="night"] .markdown-body h1,
+[data-theme-preset="night"] .markdown-body h2,
+[data-theme-preset="night"] .markdown-body h3 {
+  color: #ffffff;
+  font-weight: 600;
+}
+
+[data-theme-preset="night"] .markdown-body code {
+  background-color: var(--code-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 0.15em 0.35em;
+}
+
+[data-theme-preset="night"] .markdown-body a {
+  color: var(--link-color);
+  text-decoration: underline;
+  text-decoration-color: rgba(96, 165, 250, 0.3);
+  text-underline-offset: 2px;
+}
+
+[data-theme-preset="night"] .markdown-body a:hover {
+  text-decoration-color: var(--link-color);
+}
+
+[data-theme-preset="night"] .markdown-body hr {
+  border: none;
+  border-top: 1px solid var(--border-color);
+  margin: 2em 0;
+}

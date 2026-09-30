@@ -1,0 +1,55 @@
+/*
+ * GitHub 风格排版主题
+ * 系统无衬线字体，清爽边框，经典 GitHub 渲染风格
+ */
+[data-theme-preset="github"] {
+  --font-content: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji';
+  --doc-bg: #ffffff;
+  --doc-text: #1f2328;
+  --doc-text-muted: #656d76;
+  --doc-link: #0969da;
+  --doc-code-bg: #f6f8fa;
+  --doc-code-text: #cf222e;
+  --doc-quote-border: #d1d9e0;
+  --doc-table-border: #d1d9e0;
+  --doc-font-size: 16px;
+  --doc-line-height: 1.6;
+}
+
+/* GitHub 风格排版细节 */
+[data-theme-preset="github"] .markdown-body {
+  font-size: 16px;
+  line-height: 1.6;
+  word-wrap: break-word;
+}
+
+[data-theme-preset="github"] .markdown-body h1,
+[data-theme-preset="github"] .markdown-body h2 {
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 0.3em;
+}
+
+[data-theme-preset="github"] .markdown-body code {
+  padding: 0.2em 0.4em;
+  margin: 0;
+  font-size: 85%;
+  background-color: var(--code-bg);
+  border-radius: 6px;
+}
+
+[data-theme-preset="github"] .markdown-body pre code {
+  padding: 0;
+  background: transparent;
+}
+
+/* 暗色模式覆盖 */
+[data-theme="dark"][data-theme-preset="github"] {
+  --doc-bg: #0d1117;
+  --doc-text: #e6edf3;
+  --doc-text-muted: #8b949e;
+  --doc-link: #58a6ff;
+  --doc-code-bg: #161b22;
+  --doc-code-text: #ff7b72;
+  --doc-quote-border: #30363d;
+  --doc-table-border: #30363d;
+}

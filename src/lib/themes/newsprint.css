@@ -1,0 +1,63 @@
+/*
+ * Newsprint 报纸风格排版主题
+ * 高级衬线字体，温暖色调，经典印刷感
+ */
+[data-theme-preset="newsprint"] {
+  --font-content: 'Source Serif 4', 'Georgia', 'Noto Serif SC', 'Times New Roman', serif;
+  --doc-bg: #faf8f5;
+  --doc-text: #2c2520;
+  --doc-text-muted: #6b5e52;
+  --doc-link: #b85c38;
+  --doc-code-bg: #f0ebe3;
+  --doc-code-text: #a0522d;
+  --doc-quote-border: #c4b49c;
+  --doc-table-border: #d8d0c4;
+  --doc-font-size: 17px;
+  --doc-line-height: 1.8;
+  --doc-content-width: 720px;
+}
+
+/* Newsprint 排版细节 */
+[data-theme-preset="newsprint"] .markdown-body {
+  font-size: 17px;
+  line-height: 1.8;
+  letter-spacing: 0.01em;
+  max-width: 720px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+[data-theme-preset="newsprint"] .markdown-body h1 {
+  font-size: 2em;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin-top: 1.5em;
+}
+
+[data-theme-preset="newsprint"] .markdown-body h2 {
+  font-size: 1.5em;
+  font-weight: 600;
+  margin-top: 1.3em;
+}
+
+[data-theme-preset="newsprint"] .markdown-body p {
+  margin-bottom: 1.2em;
+  text-align: justify;
+}
+
+[data-theme-preset="newsprint"] .markdown-body blockquote {
+  font-style: italic;
+  border-left: 3px solid var(--blockquote-border);
+}
+
+/* 暗色模式覆盖 */
+[data-theme="dark"][data-theme-preset="newsprint"] {
+  --doc-bg: #1a1714;
+  --doc-text: #e8e0d6;
+  --doc-text-muted: #a89888;
+  --doc-link: #d4845a;
+  --doc-code-bg: #252018;
+  --doc-code-text: #e0a070;
+  --doc-quote-border: #4a4030;
+  --doc-table-border: #3a3328;
+}

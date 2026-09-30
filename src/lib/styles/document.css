@@ -1,0 +1,32 @@
+/* 文档排版设计令牌 */
+:root {
+  --doc-bg: #fbfbfb;
+  --doc-paper-bg: #ffffff;
+  --doc-text: #2b2b2b;
+  --doc-text-muted: #787878;
+  --doc-link: #2f67b1;
+  --doc-selection: rgba(63, 111, 181, 0.2);
+  --doc-code-bg: #f6f6f6;
+  --doc-code-text: #3f3f3f;
+  --doc-quote-border: #d8d8d8;
+  --doc-table-border: #e2e2e2;
+  --doc-subtle-rule: #eeeeee;
+  
+  --doc-content-width: 760px;
+  --doc-font-size: 16px;
+  --doc-line-height: 1.78;
+}
+
+[data-theme="dark"] {
+  --doc-bg: #1f1f1f;
+  --doc-paper-bg: #1f1f1f;
+  --doc-text: #d7d4ce;
+  --doc-text-muted: #96928c;
+  --doc-link: #7da6df;
+  --doc-selection: rgba(125, 166, 223, 0.3);
+  --doc-code-bg: #292929;
+  --doc-code-text: #d7d4ce;
+  --doc-quote-border: #56524d;
+  --doc-table-border: #46423e;
+  --doc-subtle-rule: #33302d;
+}
