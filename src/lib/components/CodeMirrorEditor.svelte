@@ -580,6 +580,15 @@
     });
   }
 
+  export function revealRange(from: number, to: number, focusEditor = false): void {
+    if (!view || from < 0 || to < from || to > view.state.doc.length) return;
+    view.dispatch({
+      selection: { anchor: from, head: to },
+      effects: EditorView.scrollIntoView(from, { y: 'center', yMargin: 48 }),
+    });
+    if (focusEditor) view.focus();
+  }
+
   export function replaceRange(from: number, to: number, text: string): void {
     if (!view) return;
     view.dispatch({

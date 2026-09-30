@@ -7,15 +7,19 @@ import {
 import { openDirectory, readDirectoryTree } from '$lib/utils/native-fs';
 
 export class WorkspaceService {
+  private static openRevision = 0;
+
   static async openFolder(): Promise<boolean> {
+    const revision = ++this.openRevision;
     try {
       const result = await openDirectory();
-      if (!result) return false;
+      if (!result || revision !== this.openRevision) return false;
 
       const directoryRef = result.path ?? result.handle;
       if (!directoryRef) return false;
 
       const entries = await readDirectoryTree(directoryRef, 5);
+      if (revision !== this.openRevision) return false;
       setDirectoryTree(entries as FileNode[], false);
       currentDirectory.set(result.path ?? result.handle?.name ?? null);
       currentDirectoryHandle.set(result.handle ?? null);

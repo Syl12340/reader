@@ -67,8 +67,8 @@ export const readFile = async (path: string): Promise<string> => {
 /**
  * 写入文件内容
  */
-export const writeFile = async (path: string, content: string, expectedContent?: string): Promise<void> => {
-  try { await invoke('write_file', { path, content, expectedContent }); }
+export const writeFile = async (path: string, content: string, expectedContent?: string, expectedMissing = false): Promise<void> => {
+  try { await invoke('write_file', { path, content, expectedContent, expectedMissing }); }
   catch (error) { throw asFileError(error); }
 };
 
@@ -222,6 +222,8 @@ export interface ContentSearchResult {
   line: number;
   column: number;
   context: string;
+  matchStart?: number;
+  matchEnd?: number;
 }
 
 export interface ContentSearchOptions {
@@ -230,6 +232,14 @@ export interface ContentSearchOptions {
   wholeWord?: boolean;
   extensions?: string[];
 }
+
+export const previewReplacement = (text: string, query: string, replacement: string, options: ContentSearchOptions) =>
+  invoke<{ content: string; count: number }>('preview_replacement', {
+    text, query, replacement,
+    caseSensitive: options.caseSensitive ?? false,
+    useRegex: options.useRegex ?? false,
+    wholeWord: options.wholeWord ?? false,
+  });
 
 export const searchContent = async (
   directory: string,

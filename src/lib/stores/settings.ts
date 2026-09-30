@@ -42,10 +42,31 @@ const DEFAULT_SETTINGS: Settings = {
   exportIncludeCss: true,
 };
 
+function finiteNumber(value: unknown, fallback: number, min: number, max: number, integer = false): number {
+  const number = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  const clamped = Math.min(max, Math.max(min, number));
+  return integer ? Math.round(clamped) : clamped;
+}
+
+export function normalizeSettings(value: Partial<Settings>): Settings {
+  const format = ['html', 'pdf', 'docx', 'epub'].includes(String(value.exportDefaultFormat))
+    ? String(value.exportDefaultFormat) : DEFAULT_SETTINGS.exportDefaultFormat;
+  return {
+    ...DEFAULT_SETTINGS,
+    ...value,
+    autoSaveInterval: finiteNumber(value.autoSaveInterval, DEFAULT_SETTINGS.autoSaveInterval, 5, 3600, true),
+    fontSize: finiteNumber(value.fontSize, DEFAULT_SETTINGS.fontSize, 10, 40),
+    lineHeight: finiteNumber(value.lineHeight, DEFAULT_SETTINGS.lineHeight, 1.2, 3),
+    tabSize: finiteNumber(value.tabSize, DEFAULT_SETTINGS.tabSize, 1, 16, true),
+    exportDefaultFormat: format,
+  };
+}
+
 function loadSettings(): Settings {
   if (typeof window === 'undefined') return DEFAULT_SETTINGS;
   try {
-    return {
+    return normalizeSettings({
       autoSave: localStorage.getItem('autoSave') === 'true',
       autoSaveInterval: parseInt(localStorage.getItem('autoSaveInterval') || '30'),
       fontSize: parseInt(localStorage.getItem('fontSize') || '16'),
@@ -64,7 +85,7 @@ function loadSettings(): Settings {
       customFontContent: localStorage.getItem('customFontContent') || '',
       exportDefaultFormat: localStorage.getItem('exportDefaultFormat') || 'html',
       exportIncludeCss: localStorage.getItem('exportIncludeCss') !== 'false',
-    };
+    });
   } catch {
     return DEFAULT_SETTINGS;
   }
@@ -74,10 +95,10 @@ export const settings = writable<Settings>(loadSettings());
 
 export function updateSettings(updates: Partial<Settings>) {
   settings.update(curr => {
-    const next = { ...curr, ...updates };
+    const next = normalizeSettings({ ...curr, ...updates });
     if (typeof window !== 'undefined') {
       try {
-        Object.entries(updates).forEach(([key, val]) => {
+        Object.entries(next).forEach(([key, val]) => {
           localStorage.setItem(key, String(val));
         });
       } catch (e) {

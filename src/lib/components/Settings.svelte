@@ -566,7 +566,7 @@
               <div class="setting-item">
                 <div class="setting-info">
                   <span class="setting-label">默认导出格式</span>
-                  <span class="setting-desc">Ctrl+S 保存时的默认格式</span>
+                  <span class="setting-desc">文件菜单“快速导出”使用的格式</span>
                 </div>
                 <select class="setting-select" bind:value={settings.exportDefaultFormat} onchange={saveSettings}>
                   <option value="html">HTML</option>

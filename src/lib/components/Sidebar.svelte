@@ -239,36 +239,12 @@
     }
   }
 
-  // 处理文件拖放
-  async function handleDrop(event: DragEvent) {
-    event.preventDefault();
-
-    const items = event.dataTransfer?.items;
-    if (!items) return;
-
-    for (const item of items) {
-      if (item.kind === 'file') {
-        const file = item.getAsFile();
-        if (file) {
-          const content = await file.text();
-          createSession(file.name, file.name, content);
-          break;
-        }
-      }
-    }
-  }
-
-  function handleDragOver(event: DragEvent) {
-    event.preventDefault();
-  }
 </script>
 
 <div
   class="flex flex-col h-full"
   role="region"
   aria-label="文件浏览器"
-  ondrop={handleDrop}
-  ondragover={handleDragOver}
 >
   <!-- Drawer tabs -->
   <div class="sidebar-drawer-tabs">

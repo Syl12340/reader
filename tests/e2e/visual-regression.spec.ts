@@ -9,8 +9,8 @@ const showcase = readFileSync(
 
 async function openShowcase(page: import('@playwright/test').Page) {
   await page.goto('/');
-  await page.getByRole('menubar').getByRole('button', { name: '文件', exact: true }).click();
-  await page.getByRole('button', { name: '新建', exact: false }).click();
+  await page.getByRole('menubar').getByRole('menuitem', { name: '文件', exact: true }).click();
+  await page.getByRole('menuitem', { name: '新建', exact: false }).click();
   await expect(page.locator('.cm-content')).toBeVisible();
   await page.evaluate((text) => {
     window.dispatchEvent(new CustomEvent('editor-replace-range', {

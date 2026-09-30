@@ -9,7 +9,7 @@
  */
 
 import { isTauri } from './platform';
-import { FileOperationError } from './file-error';
+import { FileOperationError, asFileError } from './file-error';
 import type { FileNode as TauriFileNode } from './tauri-fs';
 import type { WatchPath, FileChangeEvent } from './tauri-fs';
 export type { WatchPath } from './tauri-fs';
@@ -45,6 +45,14 @@ export interface FileSaveResult {
   handle?: FileSystemFileHandle;
   downloaded?: boolean;
 }
+export interface SaveTarget {
+  name: string;
+  path?: string;
+  handle?: FileSystemFileHandle;
+  existingContent?: string;
+  existed: boolean;
+}
+export type SaveTargetValidator = (target: SaveTarget) => boolean | Promise<boolean>;
 
 export interface IFileSystem {
   readFile(file: FileRef): Promise<string>;
@@ -53,7 +61,7 @@ export interface IFileSystem {
   openDirectory(): Promise<{ path?: string; handle?: FileSystemDirectoryHandle } | null>;
   readDirectory(dir: string | FileSystemDirectoryHandle): Promise<FileEntry[]>;
   readDirectoryTree(dir: string | FileSystemDirectoryHandle, maxDepth?: number): Promise<FileEntry[]>;
-  saveFile(filename: string, content: string, handle?: FileRef, expectedContent?: string): Promise<FileSaveResult | null>;
+  saveFile(filename: string, content: string, handle?: FileRef, expectedContent?: string, validateTarget?: SaveTargetValidator): Promise<FileSaveResult | null>;
   createFile(dir: string | FileSystemDirectoryHandle, name: string, content?: string): Promise<FileEntry | null>;
   createDirectory(dir: string | FileSystemDirectoryHandle, name: string): Promise<FileEntry | null>;
   deleteItem(dir: string | FileSystemDirectoryHandle, name: string, permanent?: boolean): Promise<void>;
@@ -122,7 +130,7 @@ class TauriFileSystem implements IFileSystem {
     return nodes.map((node: TauriFileNode) => convertTauriNode(node));
   }
 
-  async saveFile(filename: string, content: string, handle?: FileRef, expectedContent?: string): Promise<FileSaveResult | null> {
+  async saveFile(filename: string, content: string, handle?: FileRef, expectedContent?: string, validateTarget?: SaveTargetValidator): Promise<FileSaveResult | null> {
     const pathRef = handle ? (isPathRef(handle) ? handle : (handle as any).path) : null;
     if (pathRef) {
       await this.tauriFs.writeFile(pathRef, content, expectedContent);
@@ -130,7 +138,13 @@ class TauriFileSystem implements IFileSystem {
     } else {
       const path = await this.tauriFs.saveFileDialog();
       if (path) {
-        await this.tauriFs.writeFile(path, content);
+        let existingContent: string | undefined;
+        let existed = false;
+        try { existingContent = await this.tauriFs.readFile(path); existed = true; }
+        catch (error) { if (asFileError(error).code !== 'not_found') throw error; }
+        const name = path.split(/[/\\]/).pop() || filename;
+        if (validateTarget && !await validateTarget({ name, path, existingContent, existed })) return null;
+        await this.tauriFs.writeFile(path, content, existingContent, !existed);
         return { path };
       }
     }
@@ -233,7 +247,7 @@ class BrowserFileSystem implements IFileSystem {
     return await this.browserFs.readDirectoryTree(dir as FileSystemDirectoryHandle, maxDepth);
   }
 
-  async saveFile(filename: string, content: string, handle?: FileRef, expectedContent?: string): Promise<FileSaveResult | null> {
+  async saveFile(filename: string, content: string, handle?: FileRef, expectedContent?: string, validateTarget?: SaveTargetValidator): Promise<FileSaveResult | null> {
     if (handle && isHandleRef(handle)) {
       if (expectedContent !== undefined && await (await handle.getFile()).text() !== expectedContent) {
         throw new FileOperationError('conflict', '文件已发生外部修改，请重新载入或确认覆盖后保存。');
@@ -247,6 +261,13 @@ class BrowserFileSystem implements IFileSystem {
     if (pickerWindow.showSaveFilePicker) {
       try {
         const selected = await pickerWindow.showSaveFilePicker({ suggestedName: filename });
+        const existingContent = await (await selected.getFile()).text();
+        if (validateTarget && !await validateTarget({
+          name: selected.name, handle: selected, existingContent, existed: true,
+        })) return null;
+        if (await (await selected.getFile()).text() !== existingContent) {
+          throw new FileOperationError('conflict', '目标文件在确认后发生变化，已取消另存为。');
+        }
         await this.browserFs.writeFile(selected, content);
         return { handle: selected };
       } catch (error) {
@@ -330,7 +351,8 @@ export const openFile = async () => (await getFs()).openFile();
 export const openDirectory = async () => (await getFs()).openDirectory();
 export const readDirectory = async (dir: string | FileSystemDirectoryHandle) => (await getFs()).readDirectory(dir);
 export const readDirectoryTree = async (dir: string | FileSystemDirectoryHandle, maxDepth?: number) => (await getFs()).readDirectoryTree(dir, maxDepth);
-export const saveFile = async (filename: string, content: string, handle?: FileRef, expectedContent?: string) => (await getFs()).saveFile(filename, content, handle, expectedContent);
+export const saveFile = async (filename: string, content: string, handle?: FileRef, expectedContent?: string, validateTarget?: SaveTargetValidator) =>
+  (await getFs()).saveFile(filename, content, handle, expectedContent, validateTarget);
 export const createFile = async (dir: string | FileSystemDirectoryHandle, name: string, content?: string) => (await getFs()).createFile(dir, name, content);
 export const createDirectory = async (dir: string | FileSystemDirectoryHandle, name: string) => (await getFs()).createDirectory(dir, name);
 export const deleteItem = async (dir: string | FileSystemDirectoryHandle, name: string, permanent = false) => (await getFs()).deleteItem(dir, name, permanent);

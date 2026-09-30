@@ -1,6 +1,7 @@
 mod commands;
 mod file_io;
 mod pdf;
+mod search;
 
 use commands::*;
 use tauri::Manager;
@@ -33,6 +34,7 @@ pub fn run() {
             save_image,
             write_binary_file,
             search_content,
+            search::preview_replacement,
             pdf::export_pdf_native,
         ])
         .setup(|app| {

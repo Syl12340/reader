@@ -51,6 +51,14 @@ export interface EditorContentEditRequest {
   applied: boolean;
 }
 
+export interface EditorRevealRequest {
+  sessionId: string;
+  from: number;
+  to: number;
+  line: number;
+  focus?: boolean;
+}
+
 export interface WidgetRenderContext {
   filePath: string | null;
   theme: Theme;

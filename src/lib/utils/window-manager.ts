@@ -8,19 +8,16 @@ import { isTauri } from './platform';
 /**
  * 在新窗口中打开文件
  */
-export async function openInNewWindow(filePath: string): Promise<void> {
+export async function openInNewWindow(filePath: string): Promise<boolean> {
   if (!isTauri()) {
     // 浏览器模式：打开新标签
-    window.open(`/?file=${encodeURIComponent(filePath)}`, '_blank');
-    return;
+    return window.open(`/?file=${encodeURIComponent(filePath)}`, '_blank') !== null;
   }
 
   try {
     const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
-    const { join, appDataDir } = await import('@tauri-apps/api/path');
-
     // 创建新窗口，通过 URL 参数传递文件路径
-    const label = `reader-${Date.now()}`;
+    const label = `reader-${crypto.randomUUID()}`;
     const webview = new WebviewWindow(label, {
       url: `/?file=${encodeURIComponent(filePath)}`,
       title: `Reader - ${filePath.split(/[/\\]/).pop() || filePath}`,
@@ -32,12 +29,30 @@ export async function openInNewWindow(filePath: string): Promise<void> {
       resizable: true,
     });
 
-    webview.once('tauri://error', (e) => {
-      console.error('Failed to create window:', e);
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (result: boolean) => {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
+      void webview.once('tauri://created', () => finish(true));
+      void webview.once('tauri://error', (event) => {
+        console.error('Failed to create window:', event);
+        alert(`无法创建新窗口: ${String(event.payload)}`);
+        finish(false);
+      });
+      setTimeout(() => {
+        if (!settled) {
+          alert('创建新窗口超时，请重试。');
+          finish(false);
+        }
+      }, 10_000);
     });
   } catch (err) {
     console.error('Failed to open new window:', err);
-    // 降级：在当前窗口打开
+    alert(`无法创建新窗口: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
   }
 }
 

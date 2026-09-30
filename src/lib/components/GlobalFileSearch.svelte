@@ -8,6 +8,9 @@
   import { DocumentService } from '$lib/services/document';
   import { normalizePathKey } from '$lib/utils/path';
   import { asFileError } from '$lib/utils/file-error';
+  import ReplacePreview from './ReplacePreview.svelte';
+  import type { FileReplacementPreview } from '$lib/utils/change-preview';
+  import type { ContentSearchResult } from '$lib/utils/tauri-fs';
 
   let { onFileSelect }: {
     onFileSelect?: (path: string, line: number) => void;
@@ -23,7 +26,7 @@
   let showReplace = $state(false);
 
   // 结果状态
-  let results = $state<Array<{ file: string; line: number; column: number; context: string }>>([]);
+  let results = $state<ContentSearchResult[]>([]);
   let isSearching = $state(false);
   let searchTimer: ReturnType<typeof setTimeout> | null = null;
   let expandedFiles = $state<Set<string>>(new Set());
@@ -33,6 +36,16 @@
   let resultKey = $state('');
   let searchSequence = 0;
   let disposed = false;
+  let replacementPreview = $state<FileReplacementPreview[] | null>(null);
+  let previewWarnings = $state<string[]>([]);
+  let finishReview: ((items: FileReplacementPreview[] | null) => void) | null = null;
+
+  function resolveReview(items: FileReplacementPreview[] | null) {
+    const resolve = finishReview;
+    finishReview = null;
+    replacementPreview = null;
+    resolve?.(items);
+  }
   const searchKey = $derived(JSON.stringify([query, caseSensitive, useRegex, wholeWord, fileGlob,
     $currentDirectory || extractDir($currentFile || '')]));
 
@@ -44,6 +57,7 @@
     disposed = true;
     searchSequence++;
     if (searchTimer) clearTimeout(searchTimer);
+    resolveReview(null);
   });
 
   // 按文件分组的结果
@@ -66,6 +80,7 @@
   let totalFiles = $derived(groupedResults.length);
 
   function handleSearch() {
+    resolveReview(null);
     searchSequence++;
     resultKey = '';
     results = [];
@@ -79,15 +94,8 @@
     if (!q) return null;
 
     try {
-      if (useRegex) {
-        const flags = caseSensitive ? 'g' : 'gi';
-        return new RegExp(q, flags);
-      } else {
-        const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const wordBoundary = wholeWord ? `\\b${escaped}\\b` : escaped;
-        const flags = caseSensitive ? 'g' : 'gi';
-        return new RegExp(wordBoundary, flags);
-      }
+      const pattern = useRegex ? q : q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return new RegExp(wholeWord ? `\\b(?:${pattern})\\b` : pattern, caseSensitive ? 'g' : 'gi');
     } catch {
       return null;
     }
@@ -110,8 +118,7 @@
     const options = { caseSensitive, useRegex, wholeWord, extensions: selectedExtensions() };
     resultKey = '';
     isSearching = false;
-    const regex = buildRegex();
-    if (!regex) {
+    if (!searchQuery) {
       results = [];
       return;
     }
@@ -147,39 +154,59 @@
 
   // 跨文件替换
   async function replaceAllInFiles() {
-    const regex = buildRegex();
-    if (!regex || !isTauri() || isReplacing || isSearching || resultKey !== searchKey) return;
+    if (!query.trim() || !isTauri() || isReplacing || isSearching || resultKey !== searchKey) return;
     const replacement = replaceText;
+    const key = searchKey;
+    const searchQuery = query.trim();
+    const options = { caseSensitive, useRegex, wholeWord };
     const paths = groupedResults.map(group => group.file);
     if (!paths.length) return;
     isReplacing = true;
     replaceStatus = '读取替换预览...';
+    previewWarnings = [];
     let saved = 0, matches = 0, skipped = 0, conflicts = 0, failed = 0;
     try {
-      const { readFile } = await import('$lib/utils/tauri-fs');
-      const preview: Array<{ path: string; expected: string; content: string; count: number }> = [];
+      const { readFile, previewReplacement } = await import('$lib/utils/tauri-fs');
+      const preview: FileReplacementPreview[] = [];
+      let previewSize = 0;
       for (const path of paths) {
-        if (disposed) return;
+        if (disposed || key !== searchKey || replacement !== replaceText) return;
         const open = get(sessions).find(s => s.path && normalizePathKey(s.path) === normalizePathKey(path));
         if (open?.isDirty || open?.externalModified) { skipped++; continue; }
         try {
           const expected = await readFile(path);
-          regex.lastIndex = 0;
-          let count = 0;
-          const matches = expected.matchAll(regex);
-          while (!matches.next().done) count++;
-          regex.lastIndex = 0;
-          const content = expected.replace(regex, replacement);
-          if (content !== expected) preview.push({ path, expected, content, count });
+          const { content, count } = await previewReplacement(expected, searchQuery, replacement, options);
+          if (content !== expected) {
+            previewSize += expected.length + content.length;
+            if (preview.length >= 100 || previewSize > 4 * 1024 * 1024) {
+              replaceStatus = '预览超过 100 文件或 4M 字符上限，请缩小搜索范围。文件未修改。';
+              return;
+            }
+            preview.push({ path, expected, content, count });
+          }
           else skipped++;
-        } catch { failed++; }
+        } catch (error) {
+          failed++;
+          if (previewWarnings.length < 20) previewWarnings = [...previewWarnings, `${path}: ${String(error)}`];
+        }
       }
-      if (disposed) return;
-      if (preview.length && !confirm(`仅替换当前结果涉及的 ${preview.length} 个文件，共 ${preview.reduce((n, p) => n + p.count, 0)} 处。\n未保存文件跳过；替换后不能统一撤销。\n\n${preview.slice(0, 20).map(p => p.path).join('\n')}${preview.length > 20 ? '\n...' : ''}\n\n确认执行？`)) {
-        replaceStatus = '已取消替换，文件未修改';
+      if (disposed || key !== searchKey || replacement !== replaceText) return;
+      if (!preview.length) {
+        replaceStatus = `没有可替换文件；跳过 ${skipped}，读取或表达式失败 ${failed}`;
         return;
       }
-      for (const item of preview) {
+      replaceStatus = `等待审阅；跳过 ${skipped}，预览失败 ${failed}`;
+      const selected = await new Promise<FileReplacementPreview[] | null>(resolve => {
+        finishReview = resolve;
+        replacementPreview = preview;
+      });
+      if (!selected || disposed || key !== searchKey || replacement !== replaceText) {
+        replaceStatus = '已取消或搜索条件已改变，文件未修改';
+        return;
+      }
+      skipped += preview.length - selected.length;
+      replaceStatus = '正在保存恢复点并替换...';
+      for (const item of selected) {
         if (disposed) break;
         try {
           const result = await DocumentService.replaceDiskContent(item.path, item.expected, item.content);
@@ -201,16 +228,30 @@
 
   // 替换当前文件中的匹配
   async function replaceInCurrentFile() {
-    const regex = buildRegex();
-    if (!regex || !$activeSessionId) return;
+    if (!query.trim() || !$activeSessionId || isReplacing) return;
+    const id = $activeSessionId;
+    const expected = $fileContent;
+    const key = searchKey;
+    const replacement = replaceText;
+    const options = { caseSensitive, useRegex, wholeWord };
+    const searchQuery = query.trim();
+    isReplacing = true;
 
     try {
-      regex.lastIndex = 0;
-      const newContent = $fileContent.replace(regex, replaceText);
-      if (newContent !== $fileContent) {
+      let newContent: string;
+      if (isTauri()) {
+        const { previewReplacement } = await import('$lib/utils/tauri-fs');
+        newContent = (await previewReplacement(expected, searchQuery, replacement, options)).content;
+      } else {
+        const regex = buildRegex();
+        if (!regex) throw new Error('无效的浏览器正则表达式');
+        newContent = useRegex ? expected.replace(regex, replacement) : expected.replace(regex, () => replacement);
+      }
+      if (disposed || id !== $activeSessionId || key !== searchKey || replacement !== replaceText) return;
+      if (newContent !== expected) {
         const detail: EditorContentEditRequest = {
-          sessionId: $activeSessionId,
-          expectedContent: $fileContent,
+          sessionId: id,
+          expectedContent: expected,
           content: newContent,
           applied: false,
         };
@@ -225,6 +266,8 @@
       }
     } catch (err) {
       replaceStatus = `替换失败: ${err}`;
+    } finally {
+      isReplacing = false;
     }
   }
 
@@ -252,16 +295,25 @@
     expandedFiles = new Set();
   }
 
-  function highlightMatch(text: string, q: string): string {
+  function highlightMatch(text: string, q: string, from?: number, to?: number): string {
     if (!q) return escapeHtml(text);
-    const escaped = escapeHtml(text);
+    if (isTauri()) {
+      if (from === undefined || to === undefined || from < 0 || to < from || to > text.length) return escapeHtml(text);
+      return `${escapeHtml(text.slice(0, from))}<mark class="search-highlight">${escapeHtml(text.slice(from, to))}</mark>${escapeHtml(text.slice(to))}`;
+    }
     try {
       const regex = buildRegex();
-      if (!regex) return escaped;
-      regex.lastIndex = 0;
-      return escaped.replace(regex, '<mark class="search-highlight">$&</mark>');
+      if (!regex) return escapeHtml(text);
+      let output = '', previous = 0;
+      for (const match of text.matchAll(regex)) {
+        const index = match.index ?? 0;
+        output += escapeHtml(text.slice(previous, index));
+        output += `<mark class="search-highlight">${escapeHtml(match[0])}</mark>`;
+        previous = index + match[0].length;
+      }
+      return output + escapeHtml(text.slice(previous));
     } catch {
-      return escaped;
+      return escapeHtml(text);
     }
   }
 
@@ -339,6 +391,7 @@
           {isReplacing ? '替换中...' : '替换结果文件'}
         </button>
       </div>
+      <p class="search-scope">{isTauri() ? '桌面端按行匹配；正则替换支持 $1、${name}、$$，普通搜索按字面替换。' : '浏览器当前文件替换使用 JavaScript 正则，目录搜索不可用。'}</p>
     </div>
   {/if}
 
@@ -379,7 +432,7 @@
                 >
                   <span class="match-line">行 {match.line}</span>
                   <span class="match-context">
-                    {@html highlightMatch(match.context, query)}
+                    {@html highlightMatch(match.context, query, match.matchStart, match.matchEnd)}
                   </span>
                 </button>
               {/each}
@@ -395,6 +448,10 @@
     </div>
   {/if}
 </div>
+
+{#if replacementPreview}
+  <ReplacePreview items={replacementPreview} warnings={previewWarnings} onConfirm={resolveReview} onCancel={() => resolveReview(null)} />
+{/if}
 
 <style>
   .global-file-search {
@@ -434,7 +491,9 @@
   }
 
   .search-option input[type="checkbox"] {
-    display: none;
+    width: 12px;
+    height: 12px;
+    accent-color: var(--accent-color);
   }
 
   .search-option-btn {

@@ -1,165 +1,111 @@
 <script lang="ts">
-  import { fileContent } from '$lib/stores/document';
+  import { tick, untrack } from 'svelte';
+  import { activeSessionId, fileContent } from '$lib/stores/document';
+  import type { EditorContentEditRequest, EditorRevealRequest } from '$lib/types';
 
-  let { visible = $bindable(false), mode = 'search' }: {
-    visible?: boolean;
-    mode?: 'search' | 'replace';
-  } = $props();
-
+  let { visible = $bindable(false), mode = 'search' }: { visible?: boolean; mode?: 'search' | 'replace' } = $props();
   let searchQuery = $state('');
   let replaceText = $state('');
   let caseSensitive = $state(false);
   let currentMatch = $state(0);
-  let totalMatches = $state(0);
-  let matches: number[] = $state([]); // 字符偏移量数组
-  let searchInput: HTMLInputElement | undefined = $state();
+  let matches = $state<Array<{ from: number; to: number }>>([]);
+  let searchInput = $state<HTMLInputElement>();
+  let focusTimer: ReturnType<typeof setTimeout> | null = null;
+  const totalMatches = $derived(matches.length);
 
-  // 搜索
+  function literalRegex(): RegExp | null {
+    if (!searchQuery) return null;
+    return new RegExp(searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), caseSensitive ? 'g' : 'gi');
+  }
+
+  function reveal(index = currentMatch) {
+    const match = matches[index - 1];
+    const id = $activeSessionId;
+    if (!visible || !match || !id) return;
+    const detail: EditorRevealRequest = {
+      sessionId: id, ...match, line: $fileContent.slice(0, match.from).split('\n').length, focus: false,
+    };
+    window.dispatchEvent(new CustomEvent('editor-reveal-range', { detail }));
+    void tick().then(() => searchInput?.focus({ preventScroll: true }));
+  }
+
   function doSearch() {
-    const q = searchQuery;
-    if (!q) {
-      matches = [];
-      totalMatches = 0;
-      currentMatch = 0;
-      return;
-    }
-
-    const content = $fileContent;
-    if (!content) {
-      matches = [];
-      totalMatches = 0;
-      currentMatch = 0;
-      return;
-    }
-
-    const found: number[] = [];
-    const flags = caseSensitive ? 'g' : 'gi';
-    const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(escaped, flags);
-    let m: RegExpExecArray | null;
-
-    while ((m = regex.exec(content)) !== null) {
-      found.push(m.index);
-      if (found.length > 10000) break; // 安全限制
-    }
-
-    matches = found;
-    totalMatches = found.length;
-
-    if (totalMatches > 0) {
-      // 如果当前匹配超出范围，重置到第一个
-      if (currentMatch === 0 || currentMatch > totalMatches) {
-        currentMatch = 1;
+    const regex = literalRegex();
+    const found: Array<{ from: number; to: number }> = [];
+    if (visible && regex && $fileContent) {
+      for (const match of $fileContent.matchAll(regex)) {
+        const from = match.index ?? 0;
+        found.push({ from, to: from + match[0].length });
+        if (found.length >= 10_000) break;
       }
-      jumpToMatch();
-    } else {
-      currentMatch = 0;
+    }
+    matches = found;
+    currentMatch = found.length ? Math.min(Math.max(currentMatch || 1, 1), found.length) : 0;
+  }
+
+  function prevMatch() {
+    if (!totalMatches) return;
+    currentMatch = currentMatch <= 1 ? totalMatches : currentMatch - 1;
+    reveal();
+  }
+  function nextMatch() {
+    if (!totalMatches) return;
+    currentMatch = currentMatch >= totalMatches ? 1 : currentMatch + 1;
+    reveal();
+  }
+
+  function applyContent(expectedContent: string, content: string): boolean {
+    const id = $activeSessionId;
+    if (!id || content === expectedContent) return false;
+    const detail: EditorContentEditRequest = { sessionId: id, expectedContent, content, applied: false };
+    window.dispatchEvent(new CustomEvent('editor-replace-content', { detail }));
+    return detail.applied;
+  }
+
+  function replaceCurrent() {
+    const match = matches[currentMatch - 1];
+    const content = $fileContent;
+    if (!match) return;
+    if (applyContent(content, content.slice(0, match.from) + replaceText + content.slice(match.to))) {
+      void tick().then(() => { doSearch(); if (matches.length) reveal(Math.min(currentMatch, matches.length)); });
     }
   }
 
-  // 跳转到当前匹配
-  function jumpToMatch() {
-    if (matches.length === 0 || currentMatch < 1) return;
-    const idx = matches[currentMatch - 1];
-    const content = $fileContent;
-    if (!content) return;
-
-    // 通过 heading-click 事件通知编辑器跳转
-    const before = content.slice(0, idx);
-    const line = before.split('\n').length;
-    window.dispatchEvent(new CustomEvent('heading-click', { detail: { line } }));
-  }
-
-  // 上一个匹配
-  function prevMatch() {
-    if (totalMatches === 0) return;
-    currentMatch = currentMatch <= 1 ? totalMatches : currentMatch - 1;
-    jumpToMatch();
-  }
-
-  // 下一个匹配
-  function nextMatch() {
-    if (totalMatches === 0) return;
-    currentMatch = currentMatch >= totalMatches ? 1 : currentMatch + 1;
-    jumpToMatch();
-  }
-
-  // 替换当前匹配
-  function replaceCurrent() {
-    if (totalMatches === 0 || currentMatch < 1) return;
-    const idx = matches[currentMatch - 1];
-    const content = $fileContent;
-    if (!content) return;
-
-    const flags = caseSensitive ? '' : 'i';
-    const escaped = searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp('^' + escaped, flags);
-    const match = regex.exec(content.slice(idx));
-    const matchLength = match ? match[0].length : searchQuery.length;
-
-    window.dispatchEvent(new CustomEvent('editor-replace-range', {
-      detail: { from: idx, to: idx + matchLength, text: replaceText },
-    }));
-
-    // 重新搜索
-    setTimeout(doSearch, 50);
-  }
-
-  // 全部替换
   function replaceAll() {
-    if (totalMatches === 0) return;
+    const regex = literalRegex();
     const content = $fileContent;
-    if (!content) return;
-
-    const flags = caseSensitive ? 'g' : 'gi';
-    const escaped = searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(escaped, flags);
-    const newContent = content.replace(regex, replaceText);
-    window.dispatchEvent(new CustomEvent('editor-replace-range', {
-      detail: { from: 0, to: content.length, text: newContent },
-    }));
-
-    // 重新搜索
-    setTimeout(doSearch, 50);
+    if (regex) applyContent(content, content.replace(regex, () => replaceText));
   }
 
-  // 关闭
   function close() {
     visible = false;
     matches = [];
-    totalMatches = 0;
     currentMatch = 0;
+    if (focusTimer) clearTimeout(focusTimer);
   }
 
-  // 键盘事件
   function handleKeydown(event: KeyboardEvent) {
-    if (event.key === 'Escape') {
-      close();
-    } else if (event.key === 'Enter' && !event.shiftKey) {
-      if (event.ctrlKey || event.metaKey) {
-        // Ctrl+Enter = 替换当前
-        if (mode === 'replace') replaceCurrent();
-      } else {
-        nextMatch();
-      }
-    } else if (event.key === 'Enter' && event.shiftKey) {
-      prevMatch();
+    if (event.isComposing) return;
+    if (event.key === 'Escape') close();
+    else if (event.key === 'Enter' && event.shiftKey) { event.preventDefault(); prevMatch(); }
+    else if (event.key === 'Enter') {
+      event.preventDefault();
+      if ((event.ctrlKey || event.metaKey) && mode === 'replace') replaceCurrent(); else nextMatch();
     }
   }
 
-  // 当 visible 变化时聚焦搜索框
   $effect(() => {
-    if (visible && searchInput) {
-      setTimeout(() => searchInput?.focus(), 50);
-    }
+    void searchQuery;
+    void caseSensitive;
+    void $fileContent;
+    void $activeSessionId;
+    untrack(doSearch);
   });
-
-  // 搜索内容变化时重新搜索
   $effect(() => {
-    const _ = searchQuery;
-    const __ = caseSensitive;
-    if (searchQuery) doSearch();
-    else { matches = []; totalMatches = 0; currentMatch = 0; }
+    if (!visible) { matches = []; return; }
+    if (focusTimer) clearTimeout(focusTimer);
+    focusTimer = setTimeout(() => searchInput?.focus({ preventScroll: true }), 0);
+    return () => { if (focusTimer) clearTimeout(focusTimer); };
   });
 </script>
 

@@ -60,8 +60,8 @@ pub fn read_file(path: String) -> Result<String, crate::file_io::FileError> {
 
 // 写入文件内容
 #[command]
-pub fn write_file(path: String, content: String, expected_content: Option<String>) -> Result<(), crate::file_io::FileError> {
-    crate::file_io::write_text(Path::new(&path), &content, expected_content.as_deref())
+pub fn write_file(path: String, content: String, expected_content: Option<String>, expected_missing: Option<bool>) -> Result<(), crate::file_io::FileError> {
+    crate::file_io::write_text_guarded(Path::new(&path), &content, expected_content.as_deref(), expected_missing.unwrap_or(false))
 }
 
 // 读取目录结构
@@ -580,6 +580,10 @@ pub struct ContentSearchResult {
     pub line: usize,
     pub column: usize,
     pub context: String,
+    #[serde(rename = "matchStart")]
+    pub match_start: usize,
+    #[serde(rename = "matchEnd")]
+    pub match_end: usize,
 }
 
 #[command]
@@ -593,24 +597,12 @@ pub fn search_content(
     use_regex: Option<bool>,
     whole_word: Option<bool>,
 ) -> Result<Vec<ContentSearchResult>, String> {
-    use regex::RegexBuilder;
-
     let max = max_results.unwrap_or(200);
     if query.is_empty() || max == 0 {
         return Ok(Vec::new());
     }
-    let mut pattern = if use_regex.unwrap_or(false) {
-        query.clone()
-    } else {
-        regex::escape(&query)
-    };
-    if whole_word.unwrap_or(false) {
-        pattern = format!(r"\b(?:{})\b", pattern);
-    }
-    let matcher = RegexBuilder::new(&pattern)
-        .case_insensitive(!case_sensitive.unwrap_or(false))
-        .build()
-        .map_err(|error| format!("Invalid search expression: {}", error))?;
+    let matcher = crate::search::matcher(&query, case_sensitive.unwrap_or(false),
+        use_regex.unwrap_or(false), whole_word.unwrap_or(false))?;
     let mut results = Vec::new();
 
     let default_extensions = vec!["md", "txt", "markdown", "json", "js", "ts", "jsx", "tsx",
@@ -679,8 +671,10 @@ pub fn search_content(
                 results.push(ContentSearchResult {
                     file: file_path.clone(),
                     line: line_idx + 1,
-                    column: col + 1,
+                    column: line[..col].encode_utf16().count() + 1,
                     context,
+                    match_start: line[start..found.start()].encode_utf16().count(),
+                    match_end: line[start..found.end()].encode_utf16().count(),
                 });
             }
         }

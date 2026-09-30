@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
-  import type { EditorContentEditRequest, TableEditRequest } from '$lib/types';
+  import type { EditorContentEditRequest, EditorRevealRequest, TableEditRequest } from '$lib/types';
   import { isolateHistory } from '@codemirror/commands';
   import { activeSessionId } from '$lib/stores/document';
   import { focusMode, typewriterMode } from '$lib/stores/ui';
@@ -121,9 +121,18 @@
       tableRequest = request;
       tableEditorVisible = true;
     };
+    const revealHandler = (event: Event) => {
+      const detail = (event as CustomEvent<EditorRevealRequest>).detail;
+      if (!detail || detail.sessionId !== get(activeSessionId)) return;
+      editor?.revealRange(detail.from, detail.to, detail.focus ?? false);
+    };
     const replaceHandler = (event: Event) => {
-      const detail = (event as CustomEvent<{ from: number; to: number; text: string }>).detail;
-      if (detail) editor?.replaceRange(detail.from, detail.to, detail.text);
+      const detail = (event as CustomEvent<{ from: number; to: number; text: string; sessionId?: string; expectedContent?: string }>).detail;
+      const view = editor?.getView();
+      if (!detail || !view || (detail.sessionId && detail.sessionId !== get(activeSessionId))
+        || (detail.expectedContent !== undefined && detail.expectedContent !== view.state.doc.toString())
+        || detail.from < 0 || detail.to < detail.from || detail.to > view.state.doc.length) return;
+      editor?.replaceRange(detail.from, detail.to, detail.text);
     };
     const contentEditHandler = (event: Event) => {
       const detail = (event as CustomEvent<EditorContentEditRequest>).detail;
@@ -146,11 +155,13 @@
     };
     window.addEventListener('heading-click', headingHandler);
     window.addEventListener('table-edit-request', tableHandler);
+    window.addEventListener('editor-reveal-range', revealHandler);
     window.addEventListener('editor-replace-range', replaceHandler);
     window.addEventListener('editor-replace-content', contentEditHandler);
     return () => {
       window.removeEventListener('heading-click', headingHandler);
       window.removeEventListener('table-edit-request', tableHandler);
+      window.removeEventListener('editor-reveal-range', revealHandler);
       window.removeEventListener('editor-replace-range', replaceHandler);
       window.removeEventListener('editor-replace-content', contentEditHandler);
     };

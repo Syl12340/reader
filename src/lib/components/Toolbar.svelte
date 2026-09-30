@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
   import { theme, setThemePreset } from '$lib/stores/theme';
-  import { isDirty, currentFile, fileName, fileContent, createSession } from '$lib/stores/document';
+  import { isDirty, currentFile, fileName, fileContent } from '$lib/stores/document';
   import { editorMode, typewriterMode, focusMode, setEditorMode } from '$lib/stores/ui';
   import { exportAsHTML } from '$lib/utils/native-fs';
   import { isTauri } from '$lib/utils/platform';
@@ -15,6 +15,7 @@
   import { prepareExportDocument } from '$lib/services/export-document';
   import { shortcutBindings } from '$lib/services/shortcut';
   import { menuNavigation } from '$lib/utils/menu-navigation';
+  import { settings } from '$lib/stores/settings';
 
   const shortcut = (id: string) => $shortcutBindings.find(item => item.id === id)?.key ?? '';
   function runMenuCommand(id: string) {
@@ -109,6 +110,13 @@
     menuHoverEnabled = false;
   }
 
+  function closeMenuIfOpen(menu: 'file' | 'edit' | 'view' | 'help') {
+    if ((menu === 'file' && showFileMenu) || (menu === 'edit' && showEditMenu)
+      || (menu === 'view' && showViewMenu) || (menu === 'help' && showHelpMenu)) {
+      closeAllMenus();
+    }
+  }
+
   function handleMenuHover(menu: 'file' | 'edit' | 'view' | 'help') {
     if (menuHoverEnabled) {
       openMenu(menu);
@@ -176,12 +184,12 @@
     return doc.body.innerHTML;
   }
 
-  function buildExportHtml(title: string, bodyHtml: string, mode: 'light' | 'dark', embeddedCss = '') {
+  function buildExportHtml(title: string, bodyHtml: string, mode: 'light' | 'dark', embeddedCss = '', includeStyles = true) {
     const safeTitle = escapeHtml(title || 'untitled');
     const safeBodyHtml = sanitizeStaticExportHtml(bodyHtml);
     const styleOpen = '<' + 'style>';
     const styleClose = '<' + '/style>';
-    return `<!DOCTYPE html>
+    const html = `<!DOCTYPE html>
 <html lang="zh-CN" data-theme="${mode}">
 <head>
   <meta charset="UTF-8">
@@ -433,6 +441,7 @@
   </div>
 </body>
 </html>`;
+    return includeStyles ? html : html.replace(/<style>[\s\S]*?<\/style>/, '');
   }
 
   // 打开文件
@@ -500,9 +509,22 @@
 
   async function exportHTML() {
     await runPreparedExport('HTML', 'current', (snapshot, prepared) =>
-      exportAsHTML(snapshot.baseName, buildExportHtml(snapshot.title, prepared.bodyHtml, snapshot.theme, prepared.embeddedCss)),
+      exportAsHTML(snapshot.baseName, buildExportHtml(
+        snapshot.title, prepared.bodyHtml, snapshot.theme, prepared.embeddedCss, $settings.exportIncludeCss,
+      )),
     );
   }
+
+  async function exportDefault() {
+    switch ($settings.exportDefaultFormat) {
+      case 'pdf': await exportPDF(); break;
+      case 'docx': await exportDOCX(); break;
+      case 'epub': await exportEPUB(); break;
+      default: await exportHTML();
+    }
+  }
+
+  const exportFormatLabel = $derived(({ html: 'HTML', pdf: 'PDF', docx: 'Word', epub: 'EPUB' } as Record<string, string>)[$settings.exportDefaultFormat] ?? 'HTML');
 
   // 打印当前页面
   async function printDocument() {
@@ -640,28 +662,6 @@
     await DocumentService.openPath(path);
   }
 
-  // 处理文件拖放
-  async function handleDrop(event: DragEvent) {
-    event.preventDefault();
-
-    const items = event.dataTransfer?.items;
-    if (!items) return;
-
-    for (const item of items) {
-      if (item.kind === 'file') {
-        const file = item.getAsFile();
-        if (file) {
-          const content = await file.text();
-          createSession(file.name, file.name, content);
-          break;
-        }
-      }
-    }
-  }
-
-  function handleDragOver(event: DragEvent) {
-    event.preventDefault();
-  }
 </script>
 
 <div class="toolbar">
@@ -677,9 +677,10 @@
 
       <div class="menu-group" use:menuNavigation={closeAllMenus} role="menubar" tabindex="-1" data-tauri-drag-region="false" onmouseenter={cancelClose} onmouseleave={scheduleClose}>
         <!-- 文件菜单 -->
-        <div class="relative" use:clickOutside={() => showFileMenu = false}>
+        <div class="relative" use:clickOutside={() => closeMenuIfOpen('file')}>
           <button
             class="menu-button"
+            data-testid="file-menu-trigger"
             aria-haspopup="menu" aria-expanded={showFileMenu}
             onclick={() => showFileMenu ? closeAllMenus() : openMenu('file')}
             onmouseenter={() => handleMenuHover('file')}
@@ -691,27 +692,28 @@
               onmouseenter={cancelClose}
               onmouseleave={scheduleClose}
               role="menu"
+              data-testid="file-menu"
               tabindex="-1"
             >
-              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => { newFile(); showFileMenu = false; }}>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => { newFile(); closeAllMenus(); }}>
                 新建 <span class="float-right text-[var(--text-tertiary)]">{shortcut('newFile')}</span>
               </button>
-              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => { handleOpenFile(); showFileMenu = false; }}>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => { handleOpenFile(); closeAllMenus(); }}>
                 打开 <span class="float-right text-[var(--text-tertiary)]">{shortcut('openFile')}</span>
               </button>
-              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => { handleOpenFolder(); showFileMenu = false; }}>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => { handleOpenFolder(); closeAllMenus(); }}>
                 打开文件夹
               </button>
               <div class="border-t border-[var(--border-color)]"></div>
               <button
                 class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] disabled:opacity-50"
-                onclick={() => { saveFile(); showFileMenu = false; }}
+                onclick={() => { saveFile(); closeAllMenus(); }}
               >
                 保存 <span class="float-right text-[var(--text-tertiary)]">{shortcut('saveFile')}</span>
               </button>
               <button
                 class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]"
-                onclick={() => { saveFileAs(); showFileMenu = false; }}
+                onclick={() => { saveFileAs(); closeAllMenus(); }}
               >
                 另存为... <span class="float-right text-[var(--text-tertiary)]">{shortcut('saveAs')}</span>
               </button>
@@ -720,6 +722,7 @@
               <div class="relative">
                 <button
                   class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center justify-between"
+                  data-testid="export-menu-trigger"
                   onmouseenter={() => showExportSubmenu = true}
                   aria-haspopup="menu" aria-expanded={showExportSubmenu}
                   onclick={() => showExportSubmenu = !showExportSubmenu}
@@ -732,32 +735,37 @@
                     onmouseenter={() => { cancelClose(); showExportSubmenu = true; }}
                     onmouseleave={() => { showExportSubmenu = false; scheduleClose(); }}
                     role="menu"
+                    data-testid="export-submenu"
                     tabindex="-1"
                   >
-                    <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportHTML(); closeAllMenus(); }}>
+                    <button data-export-format="default" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportDefault(); closeAllMenus(); }}>
+                      快速导出为 {exportFormatLabel}
+                    </button>
+                    <div class="border-t border-[var(--border-color)]"></div>
+                    <button data-export-format="html" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportHTML(); closeAllMenus(); }}>
                       HTML
                     </button>
-                    <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportPDF(); closeAllMenus(); }}>
+                    <button data-export-format="pdf" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportPDF(); closeAllMenus(); }}>
                       PDF
                     </button>
-                    <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportDOCX(); closeAllMenus(); }}>
+                    <button data-export-format="docx" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportDOCX(); closeAllMenus(); }}>
                       Word (DOCX)
                     </button>
-                    <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportEPUB(); closeAllMenus(); }}>
+                    <button data-export-format="epub" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportEPUB(); closeAllMenus(); }}>
                       电子书 (EPUB)
                     </button>
                     <div class="border-t border-[var(--border-color)]"></div>
-                    <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportLaTeX(); closeAllMenus(); }}>
+                    <button data-export-format="latex" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportLaTeX(); closeAllMenus(); }}>
                       LaTeX (.tex)
                     </button>
-                    <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportImage(); closeAllMenus(); }}>
+                    <button data-export-format="png" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportImage(); closeAllMenus(); }}>
                       图片 (PNG)
                     </button>
                     <div class="border-t border-[var(--border-color)]"></div>
-                    <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportMarkdownVariant('gfm'); closeAllMenus(); }}>
+                    <button data-export-format="gfm" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportMarkdownVariant('gfm'); closeAllMenus(); }}>
                       GFM Markdown
                     </button>
-                    <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportMarkdownVariant('commonmark'); closeAllMenus(); }}>
+                    <button data-export-format="commonmark" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportMarkdownVariant('commonmark'); closeAllMenus(); }}>
                       CommonMark
                     </button>
                   </div>
@@ -766,14 +774,14 @@
               <div class="border-t border-[var(--border-color)]"></div>
               <button
                 class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]"
-                onclick={() => { void CommandService.execute('printDocument'); showFileMenu = false; }}
+                onclick={() => { void CommandService.execute('printDocument'); closeAllMenus(); }}
               >
                 打印 <span class="float-right text-[var(--text-tertiary)]">{shortcut('print')}</span>
               </button>
               <div class="border-t border-[var(--border-color)]"></div>
               <button
                 class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center"
-                onclick={() => { onToggleAutoSave(); showFileMenu = false; }}
+                onclick={() => { onToggleAutoSave(); closeAllMenus(); }}
               >
                 <span class="mr-2">{autoSaveEnabled ? '☑' : '☐'}</span>
                 自动保存
@@ -785,7 +793,7 @@
                   <button
                     class="w-full px-4 py-1.5 text-left hover:bg-[var(--bg-secondary)] text-sm truncate"
                     title={recentPath}
-                    onclick={() => { openRecentFile(recentPath); showFileMenu = false; }}
+                    onclick={() => { openRecentFile(recentPath); closeAllMenus(); }}
                   >
                     {recentPath.split(/[/\\]/).pop()}
                   </button>
@@ -796,7 +804,7 @@
         </div>
 
         <!-- 编辑菜单 -->
-        <div class="relative" use:clickOutside={() => showEditMenu = false}>
+        <div class="relative" use:clickOutside={() => closeMenuIfOpen('edit')}>
           <button
             class="menu-button"
             aria-haspopup="menu" aria-expanded={showEditMenu}
@@ -828,7 +836,7 @@
         </div>
 
         <!-- 视图菜单 -->
-        <div class="relative" use:clickOutside={() => showViewMenu = false}>
+        <div class="relative" use:clickOutside={() => closeMenuIfOpen('view')}>
           <button
             class="menu-button"
             aria-haspopup="menu" aria-expanded={showViewMenu}
@@ -851,24 +859,24 @@
                 {showPreview ? 'Hide' : 'Show'} Split Preview <span class="float-right text-[var(--text-tertiary)]">{shortcut('togglePreview')}</span>
               </button>
               <div class="border-t border-[var(--border-color)]"></div>
-              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center" onclick={() => { setEditorMode('wysiwym'); showViewMenu = false; }}>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center" onclick={() => { setEditorMode('wysiwym'); closeAllMenus(); }}>
                 <span class="mr-2">{$editorMode === 'wysiwym' ? '●' : '○'}</span>
                 Write
               </button>
-              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center" onclick={() => { setEditorMode('source'); showViewMenu = false; }}>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center" onclick={() => { setEditorMode('source'); closeAllMenus(); }}>
                 <span class="mr-2">{$editorMode === 'source' ? '●' : '○'}</span>
                 Source
               </button>
-              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center" onclick={() => { setEditorMode('preview'); showViewMenu = false; }}>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center" onclick={() => { setEditorMode('preview'); closeAllMenus(); }}>
                 <span class="mr-2">{$editorMode === 'preview' ? '●' : '○'}</span>
                 Read
               </button>
               <div class="border-t border-[var(--border-color)]"></div>
-              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center" onclick={() => { typewriterMode.update(v => !v); showViewMenu = false; }}>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center" onclick={() => { typewriterMode.update(v => !v); closeAllMenus(); }}>
                 <span class="mr-2">{$typewriterMode ? '☑' : '☐'}</span>
                 打字机模式
               </button>
-              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center" onclick={() => { focusMode.update(v => !v); showViewMenu = false; }}>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center" onclick={() => { focusMode.update(v => !v); closeAllMenus(); }}>
                 <span class="mr-2">{$focusMode ? '☑' : '☐'}</span>
                 专注模式
               </button>
@@ -894,7 +902,7 @@
                   >
                     {#each THEME_PRESETS as preset}
                       <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm flex items-center gap-2"
-                        onclick={() => { setThemePreset(preset.id); showViewMenu = false; showThemeSubmenu = false; }}
+                        onclick={() => { setThemePreset(preset.id); closeAllMenus(); }}
                       >
                         {preset.name}
                         <span class="text-xs text-[var(--text-tertiary)]">{preset.description}</span>
@@ -904,7 +912,7 @@
                 {/if}
               </div>
               <div class="border-t border-[var(--border-color)]"></div>
-              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => { toggleFullscreen(); showViewMenu = false; }}>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => { toggleFullscreen(); closeAllMenus(); }}>
                 全屏 <span class="float-right text-[var(--text-tertiary)]">{shortcut('fullscreen')}</span>
               </button>
             </div>
@@ -912,7 +920,7 @@
         </div>
 
         <!-- 帮助菜单 -->
-        <div class="relative" use:clickOutside={() => showHelpMenu = false}>
+        <div class="relative" use:clickOutside={() => closeMenuIfOpen('help')}>
           <button
             class="menu-button"
             aria-haspopup="menu" aria-expanded={showHelpMenu}
@@ -933,6 +941,9 @@
               </button>
               <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => runMenuCommand('commandPalette')}>
                 命令面板 <span class="float-right text-[var(--text-tertiary)]">{shortcut('commandPalette')}</span>
+              </button>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => runMenuCommand('recoveryCenter')}>
+                恢复中心...
               </button>
               <div class="border-t border-[var(--border-color)]"></div>
               <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => { showAboutDialog = true; closeAllMenus(); }}>

@@ -30,11 +30,20 @@ impl From<io::Error> for FileError {
     }
 }
 
+#[cfg(test)]
 pub fn write_text(path: &Path, content: &str, expected: Option<&str>) -> Result<(), FileError> {
-    write_bytes(path, content.as_bytes(), expected.map(str::as_bytes))
+    write_bytes_guarded(path, content.as_bytes(), expected.map(str::as_bytes), false)
 }
 
 pub fn write_bytes(path: &Path, content: &[u8], expected: Option<&[u8]>) -> Result<(), FileError> {
+    write_bytes_guarded(path, content, expected, false)
+}
+
+pub fn write_text_guarded(path: &Path, content: &str, expected: Option<&str>, expected_missing: bool) -> Result<(), FileError> {
+    write_bytes_guarded(path, content.as_bytes(), expected.map(str::as_bytes), expected_missing)
+}
+
+pub fn write_bytes_guarded(path: &Path, content: &[u8], expected: Option<&[u8]>, expected_missing: bool) -> Result<(), FileError> {
     let _lock = WRITE_LOCK.lock().map_err(|_| FileError {
         code: "io_error", message: "File write lock unavailable".into(),
     })?;
@@ -49,6 +58,9 @@ pub fn write_bytes(path: &Path, content: &[u8], expected: Option<&[u8]>) -> Resu
         Err(error) if error.kind() == io::ErrorKind::NotFound && expected.is_none() => None,
         Err(error) => return Err(error.into()),
     };
+    if expected_missing && metadata.is_some() {
+        return Err(FileError { code: "conflict", message: "Save target was created after it was selected".into() });
+    }
     if metadata.as_ref().is_some_and(|value| value.permissions().readonly()) {
         return Err(FileError { code: "permission_denied", message: "File is read-only".into() });
     }
@@ -73,13 +85,37 @@ pub fn write_bytes(path: &Path, content: &[u8], expected: Option<&[u8]>) -> Resu
                 return Err(FileError { code: "conflict", message: "File changed since replacement preview".into() });
             }
         }
-        fs::rename(&temp_path, &target)?;
+        if expected_missing && target.exists() {
+            return Err(FileError { code: "conflict", message: "Save target was created before the write completed".into() });
+        }
+        replace_file(&temp_path, &target)?;
         #[cfg(unix)]
         if let Ok(directory) = fs::File::open(parent) { let _ = directory.sync_all(); }
         Ok(())
     })();
     if result.is_err() { let _ = fs::remove_file(&temp_path); }
     result
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, target: &Path) -> Result<(), FileError> {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+
+    let source = HSTRING::from(source.as_os_str());
+    let target = HSTRING::from(target.as_os_str());
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }.map_err(|error| io::Error::from_raw_os_error(error.code().0).into())
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, target: &Path) -> Result<(), FileError> {
+    fs::rename(source, target).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -129,5 +165,23 @@ mod tests {
         let error = write_text(&fixture.file(), "after", Some("before")).unwrap_err();
         assert_eq!(error.code, "not_found");
         assert!(!fixture.file().exists());
+    }
+
+    #[test]
+    fn existing_target_is_replaced_without_leaving_a_temporary_file() {
+        let fixture = Fixture::new();
+        fs::write(fixture.file(), b"old").unwrap();
+        write_bytes_guarded(&fixture.file(), b"new", Some(b"old"), false).unwrap();
+        assert_eq!(fs::read(fixture.file()).unwrap(), b"new");
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn newly_created_save_as_target_is_not_overwritten() {
+        let fixture = Fixture::new();
+        fs::write(fixture.file(), b"external").unwrap();
+        let error = write_bytes_guarded(&fixture.file(), b"ours", None, true).unwrap_err();
+        assert_eq!(error.code, "conflict");
+        assert_eq!(fs::read(fixture.file()).unwrap(), b"external");
     }
 }

@@ -160,10 +160,13 @@ export async function loadNodeChildren(node: FileNode) {
     return;
   }
 
+  const rootPath = get(currentDirectory);
+  const rootHandle = get(currentDirectoryHandle);
   try {
     const directoryRef = isTauri() ? node.path : node.handle;
     if (!directoryRef) return;
     const entries = await readDirectory(directoryRef);
+    if (get(currentDirectory) !== rootPath || get(currentDirectoryHandle) !== rootHandle) return;
     const children: FileNode[] = entries.map(entry => ({
       name: entry.name,
       path: isTauri() ? entry.path : `${node.path}/${entry.name}`,

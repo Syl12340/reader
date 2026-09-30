@@ -6,6 +6,8 @@
   import { editorMode, setEditorMode } from '$lib/stores/ui';
   import { DocumentService } from '$lib/services/document';
   import { getSaveStatus } from '$lib/utils/save-status';
+  import { recoveryStorageError } from '$lib/services/recovery';
+  import { CommandService } from '$lib/services/command';
 
   const saveStatus = derived(activeSession, getSaveStatus);
 
@@ -33,6 +35,10 @@
 
 <div class="status-bar" aria-label="Document status">
   <div class="status-bar-left">
+    {#if $recoveryStorageError}
+      <button type="button" class="status-bar-item external-change" title={$recoveryStorageError}
+        onclick={() => { void CommandService.execute('recoveryCenter'); }}>恢复存储异常</button>
+    {/if}
     {#if $currentFile || $isEditing}
       <span class="status-bar-item save-state" class:dirty={$isDirty || $activeSession?.saveState === 'error'} role="status" title={$saveStatus.detail}>
         <span class="dirty-dot" aria-hidden="true"></span>

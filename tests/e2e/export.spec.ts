@@ -16,8 +16,8 @@ const markdown = [
 
 async function createDocument(page: Page) {
   await page.goto('/');
-  await page.getByRole('menubar').getByRole('button', { name: '文件', exact: true }).click();
-  await page.getByRole('button', { name: '新建', exact: false }).click();
+  await page.getByRole('menubar').getByRole('menuitem', { name: '文件', exact: true }).click();
+  await page.getByRole('menuitem', { name: '新建', exact: false }).click();
   await expect(page.locator('.cm-content')).toBeVisible();
   await page.evaluate((text) => {
     window.dispatchEvent(new CustomEvent('editor-replace-range', {
@@ -27,9 +27,9 @@ async function createDocument(page: Page) {
 }
 
 async function exportDownload(page: Page, label: string): Promise<Download> {
-  await page.getByRole('menubar').getByRole('button', { name: '文件', exact: true }).click();
-  await page.getByRole('button', { name: /^导出/ }).hover();
-  const item = page.getByRole('button', { name: label, exact: true });
+  await page.getByTestId('file-menu-trigger').click();
+  await page.getByTestId('export-menu-trigger').hover();
+  const item = page.getByTestId('export-submenu').getByRole('menuitem', { name: label, exact: true });
   await expect(item).toBeVisible();
   const download = page.waitForEvent('download');
   await item.click();
@@ -49,7 +49,7 @@ test.beforeEach(async ({ page }) => {
 test('exports a standalone sanitized HTML document', async ({ page }) => {
   const download = await exportDownload(page, 'HTML');
   const content = (await downloadBytes(download)).toString('utf8');
-  expect(download.suggestedFilename()).toBe('untitled.html');
+  expect(download.suggestedFilename()).toBe('未命名.html');
   expect(content).toContain('<!DOCTYPE html>');
   expect(content).toContain('Export Heading');
   expect(content).toContain('katex');
@@ -57,15 +57,16 @@ test('exports a standalone sanitized HTML document', async ({ page }) => {
 });
 
 test('exports real DOCX and EPUB ZIP containers', async ({ page }) => {
+  page.once('dialog', dialog => dialog.accept());
   const docx = await exportDownload(page, 'Word (DOCX)');
   const docxBytes = await downloadBytes(docx);
-  expect(docx.suggestedFilename()).toBe('untitled.docx');
+  expect(docx.suggestedFilename()).toBe('未命名.docx');
   expect(Array.from(docxBytes.subarray(0, 4))).toEqual([0x50, 0x4b, 0x03, 0x04]);
   expect(docxBytes.includes(Buffer.from('word/document.xml'))).toBe(true);
 
   const epub = await exportDownload(page, '电子书 (EPUB)');
   const epubBytes = await downloadBytes(epub);
-  expect(epub.suggestedFilename()).toBe('untitled.epub');
+  expect(epub.suggestedFilename()).toBe('未命名.epub');
   expect(Array.from(epubBytes.subarray(0, 4))).toEqual([0x50, 0x4b, 0x03, 0x04]);
   expect(epubBytes.includes(Buffer.from('application/epub+zip'))).toBe(true);
   expect(epubBytes.includes(Buffer.from('OEBPS/content.opf'))).toBe(true);
@@ -74,7 +75,7 @@ test('exports real DOCX and EPUB ZIP containers', async ({ page }) => {
 test('exports LaTeX and Markdown variants from current content', async ({ page }) => {
   const latex = await exportDownload(page, 'LaTeX (.tex)');
   const latexContent = (await downloadBytes(latex)).toString('utf8');
-  expect(latex.suggestedFilename()).toBe('untitled.tex');
+  expect(latex.suggestedFilename()).toBe('未命名.tex');
   expect(latexContent).toContain('\\section{Export Heading}');
   expect(latexContent).toContain('$E = mc^2$');
 
@@ -88,9 +89,10 @@ test('exports LaTeX and Markdown variants from current content', async ({ page }
 });
 
 test('exports a rendered PNG instead of a blank placeholder canvas', async ({ page }) => {
+  page.once('dialog', dialog => dialog.accept());
   const download = await exportDownload(page, '图片 (PNG)');
   const bytes = await downloadBytes(download);
-  expect(download.suggestedFilename()).toBe('untitled.png');
+  expect(download.suggestedFilename()).toBe('未命名.png');
   expect(Array.from(bytes.subarray(0, 8))).toEqual([137, 80, 78, 71, 13, 10, 26, 10]);
   expect(bytes.length).toBeGreaterThan(1000);
 });
@@ -111,9 +113,9 @@ test('builds printable PDF content and invokes the print flow', async ({ page })
     }) as EventListener);
   });
 
-  await page.getByRole('menubar').getByRole('button', { name: '文件', exact: true }).click();
-  await page.getByRole('button', { name: /^导出/ }).hover();
-  await page.getByRole('button', { name: 'PDF', exact: true }).click();
+  await page.getByTestId('file-menu-trigger').click();
+  await page.getByTestId('export-menu-trigger').hover();
+  await page.locator('[data-export-format="pdf"]').click();
   await expect.poll(() => page.evaluate(() => (window as any).__readerPdfTest.printed)).toBe(true);
   const html = await page.evaluate(() => (window as any).__readerPdfTest.html);
   expect(html).toContain('<!DOCTYPE html>');

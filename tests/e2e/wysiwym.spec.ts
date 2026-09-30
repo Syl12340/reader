@@ -29,8 +29,8 @@ const sample = [
 ].join('\n');
 
 async function createNewDocument(page: import('@playwright/test').Page) {
-  await page.getByRole('menubar').getByRole('button', { name: '文件', exact: true }).click();
-  await page.getByRole('button', { name: '新建', exact: false }).click();
+  await page.getByRole('menubar').getByRole('menuitem', { name: '文件', exact: true }).click();
+  await page.getByRole('menuitem', { name: '新建', exact: false }).click();
   await expect(page.locator('.cm-content')).toBeVisible();
 }
 
@@ -179,7 +179,7 @@ test('keeps document state across editor modes', async ({ page }) => {
   expect(sourcePresentation.fontFamily).toMatch(/monospace|Consolas|JetBrains Mono|Cascadia Code/i);
   expect(sourcePresentation.fontWeight).toBeLessThan(600);
   expect(sourcePresentation.textDecoration).toBe('none');
-  expect(sourcePresentation.highlightedSpans).toBe(0);
+  expect(sourcePresentation.highlightedSpans).toBeGreaterThan(0);
   const sourceViewportPresentation = await page.locator('.cm-line').evaluateAll(elements =>
     elements.slice(0, 12).map(element => {
       const style = getComputedStyle(element as HTMLElement);

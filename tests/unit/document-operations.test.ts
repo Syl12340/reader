@@ -4,6 +4,9 @@ import { activeSessionId, createSession, sessions, updateSessionContent } from '
 import { DocumentService } from '../../src/lib/services/document';
 import { RecoveryService } from '../../src/lib/services/recovery';
 import { readFile, saveFile, type FileSaveResult } from '../../src/lib/utils/native-fs';
+import { writeFile } from '../../src/lib/utils/tauri-fs';
+
+vi.mock('../../src/lib/utils/tauri-fs', () => ({ writeFile: vi.fn() }));
 
 vi.mock('../../src/lib/utils/native-fs', () => ({
   saveFile: vi.fn(), readFile: vi.fn(), openFile: vi.fn(),
@@ -15,6 +18,7 @@ describe('document operation boundaries', () => {
     activeSessionId.set(null);
     RecoveryService.clearAllSnapshots();
     vi.clearAllMocks();
+    localStorage.clear();
     vi.spyOn(window, 'alert').mockImplementation(() => {});
     vi.spyOn(window, 'confirm').mockReturnValue(true);
   });
@@ -77,6 +81,32 @@ describe('document operation boundaries', () => {
     expect(get(sessions)[0].isDirty).toBe(true);
   });
 
+  it('blocks Save As when the selected target belongs to another open tab', async () => {
+    const sourceId = createSession('draft.md', null, 'draft', '');
+    const targetId = createSession('target.md', 'C:/target.md', 'target', 'target');
+    activeSessionId.set(sourceId);
+    vi.mocked(saveFile).mockImplementationOnce(async (_name, _content, _handle, _expected, validate) => {
+      expect(validate).toBeTypeOf('function');
+      const accepted = await validate!({ path: 'C:/target.md', name: 'target.md', existed: true });
+      return accepted ? { path: 'C:/target.md' } : null;
+    });
+    expect(await DocumentService.saveSessionAs(sourceId)).toBe(false);
+    expect(get(activeSessionId)).toBe(targetId);
+    expect(get(sessions).find(session => session.id === sourceId)?.path).toBeNull();
+  });
+
+  it('requires overwrite confirmation before Save As replaces an existing target', async () => {
+    const id = createSession('draft.md', null, 'draft', '');
+    vi.mocked(window.confirm).mockReturnValueOnce(false);
+    vi.mocked(saveFile).mockImplementationOnce(async (_name, _content, _handle, _expected, validate) => {
+      const accepted = await validate!({ path: 'C:/existing.md', name: 'existing.md', existed: true });
+      return accepted ? { path: 'C:/existing.md' } : null;
+    });
+    expect(await DocumentService.saveSessionAs(id)).toBe(false);
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('确认覆盖'));
+    expect(get(sessions)[0].path).toBeNull();
+  });
+
   it('preserves dirty tabs and their recovery snapshot when a folder is removed', async () => {
     createSession('note.md', 'C:/notes/note.md', 'edit', 'baseline');
     const remove = vi.fn().mockResolvedValue(undefined);
@@ -103,5 +133,30 @@ describe('document operation boundaries', () => {
     await expect(DocumentService.deleteEntry('C:/note.md', false, false, remove)).rejects.toThrow('trash unavailable');
     expect(remove).toHaveBeenCalledOnce();
     expect(get(sessions)[0].externalMissing).not.toBe(true);
+  });
+
+  it('restores a separate untitled copy without changing the original tab or removing its snapshot', () => {
+    const original = createSession('note.md', 'C:/note.md', 'current', 'baseline');
+    RecoveryService.saveSnapshot(get(sessions)[0]);
+    const snapshot = RecoveryService.getSnapshots()[0];
+    const copy = DocumentService.restoreSnapshotAsCopy(snapshot);
+    expect(copy).not.toBe(original);
+    expect(get(sessions).find(s => s.id === original)).toMatchObject({ path: 'C:/note.md', content: 'current' });
+    expect(get(sessions).find(s => s.id === copy)).toMatchObject({ path: null, content: 'current', isDirty: true, name: 'note (恢复副本).md' });
+    expect(RecoveryService.getSnapshots().some(s => s.id === original)).toBe(true);
+  });
+
+  it('persists the original version before invoking a disk replacement', async () => {
+    vi.mocked(writeFile).mockImplementationOnce(async () => {
+      expect(RecoveryService.getRecoveryItems()).toEqual([expect.objectContaining({ kind: 'checkpoint', content: 'before' })]);
+    });
+    expect(await DocumentService.replaceDiskContent('C:/note.md', 'before', 'after')).toBe('saved');
+    expect(writeFile).toHaveBeenCalledWith('C:/note.md', 'after', 'before');
+  });
+
+  it('blocks disk replacement when its recovery checkpoint cannot be persisted', async () => {
+    vi.spyOn(RecoveryService, 'saveCheckpoint').mockReturnValueOnce(false);
+    await expect(DocumentService.replaceDiskContent('C:/note.md', 'before', 'after')).rejects.toThrow('恢复点');
+    expect(writeFile).not.toHaveBeenCalled();
   });
 });

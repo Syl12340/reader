@@ -28,15 +28,18 @@
   import Breadcrumb from '$lib/components/Breadcrumb.svelte';
   import SettingsComponent from '$lib/components/Settings.svelte';
   import CommandPalette from '$lib/components/CommandPalette.svelte';
+  import RecoveryCenter from '$lib/components/RecoveryCenter.svelte';
   import '../app.css';
 
   let showSidebar = $state(false);
   let showSearchReplace = $state(false);
   let showSettings = $state(false);
   let showCommandPalette = $state(false);
+  let showRecoveryCenter = $state(false);
   const paletteCommands = $derived([
     { id: 'newFile', label: '新建文档' },
     { id: 'openFile', label: '打开文件' },
+    { id: 'recoveryCenter', label: '恢复中心：草稿与替换前版本' },
     { id: 'saveFile', label: '保存文档', disabled: !$activeSessionId },
     { id: 'saveAs', label: '另存为', disabled: !$activeSessionId },
     { id: 'print', label: '打印文档', disabled: !$activeSessionId },
@@ -408,10 +411,16 @@
 
     // 加载侧边栏宽度
     const savedWidth = localStorage.getItem('sidebarWidth');
-    if (savedWidth) sidebarWidth = parseInt(savedWidth);
+    if (savedWidth) {
+      const width = Number(savedWidth);
+      if (Number.isFinite(width)) sidebarWidth = Math.min(560, Math.max(180, width));
+    }
 
     const savedSplit = localStorage.getItem('splitRatio');
-    if (savedSplit) splitRatio = parseFloat(savedSplit);
+    if (savedSplit) {
+      const ratio = Number(savedSplit);
+      if (Number.isFinite(ratio)) splitRatio = Math.min(MAX_SPLIT_RATIO, Math.max(MIN_SPLIT_RATIO, ratio));
+    }
 
     // 加载自动保存设置
     const unsubscribeAutoSave = settings.subscribe(($settings) => {
@@ -424,6 +433,9 @@
 
     // 加载最近文件
     loadRecentFiles();
+
+    const initialFile = new URL(window.location.href).searchParams.get('file');
+    if (initialFile) void DocumentService.openPath(initialFile);
 
     // 未保存检测（浏览器 beforeunload）
     if (!isTauri()) {
@@ -561,43 +573,17 @@
     registerCommand('settings', () => {
       showSettings = true;
     });
+    registerCommand('recoveryCenter', () => {
+      showRecoveryCenter = true;
+    });
 
     // 检查是否有异常退出的恢复快照
     const snapshots = RecoveryService.getSnapshots();
     let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
     if (snapshots.length > 0) {
-      recoveryTimer = setTimeout(async () => {
+      recoveryTimer = setTimeout(() => {
         if (fsSyncDisposed) return;
-        let confirmRestore = false;
-        try {
-          const { ask } = await import('@tauri-apps/plugin-dialog');
-          confirmRestore = await ask('检测到上次未正常关闭，是否恢复未保存的工作区内容？', {
-            title: '恢复工作区',
-            kind: 'info',
-            okLabel: '恢复',
-            cancelLabel: '忽略',
-          });
-        } catch {
-          confirmRestore = confirm('检测到上次未正常关闭，是否恢复未保存的工作区内容？');
-        }
-
-        if (fsSyncDisposed) return;
-        if (confirmRestore) {
-          let failed = 0;
-          snapshots.forEach(s => {
-            const alreadyOpen = s.path && get(sessions).some(item => item.path
-              && normalizePathKey(item.path) === normalizePathKey(s.path!));
-            const sid = createSession(alreadyOpen ? `${s.name} (恢复副本)` : s.name,
-              alreadyOpen ? null : s.path, s.content, s.savedContent);
-            sessions.update(list => list.map(x => x.id === sid ? { ...x, cursorOffset: s.cursorOffset, scrollTop: s.scrollTop } : x));
-            const restored = get(sessions).find(item => item.id === sid);
-            if (restored && RecoveryService.saveSnapshot(restored)) {
-              if (s.id !== sid) RecoveryService.removeSnapshot(s.id);
-            } else failed++;
-          });
-          if (failed) alert('部分恢复内容未能重新写入恢复存储，旧快照已保留，请尽快另存文件。');
-        }
-        // Ignoring recovery is not an instruction to delete unsaved work.
+        showRecoveryCenter = true;
       }, 500);
     }
 
@@ -670,7 +656,8 @@
         const file = item.getAsFile();
         if (file && (file.name.endsWith('.md') || file.name.endsWith('.txt') || file.name.endsWith('.markdown'))) {
           const content = await file.text();
-          createSession(file.name, file.name, content);
+          // Web drag data does not prove a durable filesystem identity. Import a dirty copy.
+          createSession(file.name, null, content, '');
           break;
         }
       }
@@ -770,6 +757,7 @@
 
 <!-- 设置界面 -->
 <SettingsComponent bind:visible={showSettings} />
+<RecoveryCenter bind:visible={showRecoveryCenter} />
 <CommandPalette bind:visible={showCommandPalette} commands={paletteCommands} />
 
 <!-- 未保存更改确认框 -->

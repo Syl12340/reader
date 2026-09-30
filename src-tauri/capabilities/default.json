@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-capability",
   "description": "Allow the main window to call required Reader APIs.",
-  "windows": ["main"],
+  "windows": ["main", "reader-*"],
   "permissions": [
     "core:default",
     "core:window:allow-close",

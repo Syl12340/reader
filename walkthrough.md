@@ -114,3 +114,9 @@ Last write: 2026-06-16 00:14:42
 - DOCX 当前将图片转换为替代文本，尚未写入 OOXML media relationship。
 - EPUB 当前不打包本地图片与字体，跨设备打开时外部资源可能不可用。
 - PNG/JPG 在 SVG `foreignObject` 不可用时会降级为纯文本排版，确保不导出空白文件。
+
+## 2026-09-30 稳定性收口
+
+本轮补齐了搜索精确定位、另存为目标协调、Windows 原子覆盖写、恢复存储治理、菜单状态复位、新窗口文件载入和 PDF 页面就绪/临时文件提交。默认导出格式与 HTML CSS 开关已接入真实命令，源码模式保留 Markdown 语法高亮。
+
+当前自动化结果：`pnpm check` 为 0 errors / 0 warnings，Vitest 为 60 passed，Rust 为 8 passed，Playwright 为 19 passed，前端与 Tauri release 构建成功。新可执行文件位于 `D:\Shaoyilei\Desktop\Workspace\code\reader\target\release\reader.exe`。上方较早的测试数量及 DOCX/EPUB 资源限制已被后续实现取代；仍需在 Windows 桌面进程中人工确认系统打印、另存为竞态和新窗口行为。

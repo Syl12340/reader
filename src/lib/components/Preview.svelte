@@ -6,6 +6,7 @@
   import { setEditorMode } from '$lib/stores/ui';
   import FloatingTOC from './FloatingTOC.svelte';
   import { patchPreviewHtml } from '$lib/utils/dom-patch';
+  import type { EditorRevealRequest } from '$lib/types';
 
   let { content }: { content: string } = $props();
 
@@ -118,6 +119,16 @@
     return () => window.removeEventListener('heading-click', handler);
   });
 
+  $effect(() => {
+    if (!previewContainer) return;
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<EditorRevealRequest>).detail;
+      if (detail?.sessionId === get(activeSessionId)) scrollTo(detail.line);
+    };
+    window.addEventListener('editor-reveal-range', handler);
+    return () => window.removeEventListener('editor-reveal-range', handler);
+  });
+
   async function handlePreviewClick(event: Event) {
     const target = event.target;
     if (!(target instanceof HTMLElement)) return;
@@ -165,7 +176,10 @@
         const from = lineOffset + marker.index;
         const text = marker[0] === '[ ]' ? '[x]' : '[ ]';
         window.dispatchEvent(new CustomEvent('editor-replace-range', {
-          detail: { from, to: from + marker[0].length, text },
+          detail: {
+            sessionId: get(activeSessionId), expectedContent: content,
+            from, to: from + marker[0].length, text,
+          },
         }));
         return;
       }

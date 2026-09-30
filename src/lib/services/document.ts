@@ -8,8 +8,8 @@ import {
   markSessionExternalModified,
   markSessionsMissingUnderPath,
 } from '$lib/stores/document';
-import { saveFile as fsSaveFile, openFile as fsOpenFile, readFile as fsReadFile } from '$lib/utils/native-fs';
-import { RecoveryService } from './recovery';
+import { saveFile as fsSaveFile, openFile as fsOpenFile, readFile as fsReadFile, type SaveTarget } from '$lib/utils/native-fs';
+import { RecoveryService, type RecoverySnapshot } from './recovery';
 import { normalizePathKey, pathContains } from '$lib/utils/path';
 import { asFileError } from '$lib/utils/file-error';
 
@@ -26,6 +26,7 @@ export class DocumentService {
   private static closeQueue: Promise<void> = Promise.resolve();
   private static closingAll: Promise<boolean> | null = null;
   private static deletingPaths = new Set<string>();
+  private static saveTargets = new Set<string>();
 
   private static isDeleting(path: string | null): boolean {
     return !!path && [...this.deletingPaths].some(root => pathContains(root, path));
@@ -100,6 +101,7 @@ export class DocumentService {
       if (this.isDeleting(path)) return false;
       const current = findSession();
       if (current && (current.isDirty || current.externalModified || current.content !== expected)) return false;
+      if (!RecoveryService.saveCheckpoint(path, expected)) throw new Error('替换前恢复点保存失败，文件未修改。');
       await writeFile(path, content, expected);
       saved = true;
       const latest = findSession();
@@ -114,6 +116,18 @@ export class DocumentService {
 
   static createNewSession(name = 'untitled.md'): string {
     return createSession(name, null, '');
+  }
+
+  static restoreSnapshotAsCopy(snapshot: RecoverySnapshot): string {
+    const name = snapshot.name.replace(/(\.[^.]+)?$/, ' (恢复副本)$1');
+    const id = createSession(name, null, snapshot.content, '');
+    sessions.update(list => list.map(session => session.id === id ? {
+      ...session, cursorOffset: Math.min(snapshot.content.length, snapshot.cursorOffset), scrollTop: snapshot.scrollTop,
+    } : session));
+    const restored = get(sessions).find(session => session.id === id);
+    if (restored) RecoveryService.saveSnapshot(restored);
+    // The original stays available even if persisting the new copy fails.
+    return id;
   }
 
   /**
@@ -139,11 +153,41 @@ export class DocumentService {
         : '磁盘文件已被外部修改。继续保存将覆盖外部版本，是否继续？')
     ) return false;
 
+    let reservedTarget: string | null = null;
+    const validateTarget = async (target: SaveTarget): Promise<boolean> => {
+      const key = target.path ? `path:${normalizePathKey(target.path)}` : `handle:${target.name.toLocaleLowerCase()}`;
+      if (this.saveTargets.has(key)) {
+        alert('另一个保存操作正在写入同一目标，请等待完成后重试。');
+        return false;
+      }
+      for (const other of get(sessions)) {
+        if (other.id === id) continue;
+        let same = !!(target.path && other.path && normalizePathKey(target.path) === normalizePathKey(other.path));
+        if (!same && target.handle && other.fileHandle) {
+          if (target.handle === other.fileHandle) same = true;
+          else if (typeof target.handle.isSameEntry === 'function') {
+            try { same = await target.handle.isSameEntry(other.fileHandle); } catch {}
+          }
+        }
+        if (same) {
+          activeSessionId.set(other.id);
+          alert(`目标文件已在标签“${other.name}”中打开。为避免产生两个竞争版本，另存为已取消。`);
+          return false;
+        }
+      }
+      if (target.existed && !confirm(`目标文件“${target.name}”已存在。确认覆盖当前磁盘版本？`)) return false;
+      this.saveTargets.add(key);
+      reservedTarget = key;
+      return true;
+    };
+
     sessions.update(list => list.map(s => s.id === id ? { ...s, saveState: 'saving' as const, saveError: undefined } : s));
     try {
       const handle = saveAs ? undefined : session.fileHandle || session.path || undefined;
       const expected = !saveAs && handle && !session.externalModified ? session.savedContent : undefined;
-      const result = await fsSaveFile(session.name, session.content, handle, expected);
+      const result = saveAs
+        ? await fsSaveFile(session.name, session.content, handle, expected, validateTarget)
+        : await fsSaveFile(session.name, session.content, handle, expected);
       if (!result) return false;
       if (result.downloaded) {
         alert('已下载文件副本。浏览器无法确认原文件已保存，当前修改仍保留为未保存状态。');
@@ -192,6 +236,7 @@ export class DocumentService {
       }
       alert(`保存文件失败: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
+      if (reservedTarget) this.saveTargets.delete(reservedTarget);
       sessions.update(list => list.map(s => s.id === id && s.saveState === 'saving'
         ? { ...s, saveState: session.saveState === 'error' ? 'error' as const : undefined, saveError: session.saveError }
         : s));
