@@ -7,6 +7,12 @@ import { readFile, saveFile, type FileSaveResult } from '../../src/lib/utils/nat
 import { writeFile } from '../../src/lib/utils/tauri-fs';
 
 vi.mock('../../src/lib/utils/tauri-fs', () => ({ writeFile: vi.fn() }));
+vi.mock('../../src/lib/utils/platform', () => ({ isTauri: () => true }));
+vi.mock('../../src/lib/services/interaction', () => ({
+  notify: vi.fn(),
+  confirmAction: async (_title: string, message: string) => window.confirm(message),
+  ask: async ({ message }: { message: string }) => window.confirm(message) ? 'overwrite' : 'cancel',
+}));
 
 vi.mock('../../src/lib/utils/native-fs', () => ({
   saveFile: vi.fn(), readFile: vi.fn(), openFile: vi.fn(),
@@ -26,6 +32,18 @@ describe('document operation boundaries', () => {
     sessions.set([]);
     RecoveryService.clearAllSnapshots();
     vi.restoreAllMocks();
+  });
+
+  it('drops a cancelled file-open result and suppresses its stale error', async () => {
+    let current = true;
+    let finish!: (text: string) => void;
+    vi.mocked(readFile).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const pending = DocumentService.openPath('C:/cancelled.md', () => current);
+    await Promise.resolve(); current = false; finish('old result');
+    expect(await pending).toBeNull(); expect(get(sessions)).toHaveLength(0);
+    vi.mocked(readFile).mockRejectedValueOnce(new Error('old error'));
+    expect(await DocumentService.openPath('C:/cancelled.md', () => false)).toBeNull();
+    expect(window.alert).not.toHaveBeenCalled();
   });
 
   it('preserves edits and recovery data made while a save is in flight', async () => {
@@ -105,6 +123,19 @@ describe('document operation boundaries', () => {
     expect(await DocumentService.saveSessionAs(id)).toBe(false);
     expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('确认覆盖'));
     expect(get(sessions)[0].path).toBeNull();
+  });
+
+  it('validates the target on the first ordinary save, not only Save As', async () => {
+    const id = createSession('draft.md', null, 'draft', '');
+    createSession('target.md', 'C:/notes/target.md', 'disk');
+    activeSessionId.set(id);
+    vi.mocked(saveFile).mockImplementationOnce(async (_name, _content, _handle, _expected, validate) => {
+      expect(validate).toBeTypeOf('function');
+      expect(await validate!({ path: 'C:/notes/sub/../target.md', name: 'target.md', existed: true })).toBe(false);
+      return null;
+    });
+    expect(await DocumentService.saveSession(id)).toBe(false);
+    expect(get(sessions).find(session => session.id === id)?.path).toBeNull();
   });
 
   it('preserves dirty tabs and their recovery snapshot when a folder is removed', async () => {

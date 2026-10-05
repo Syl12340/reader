@@ -6,9 +6,18 @@
   import { setEditorMode } from '$lib/stores/ui';
   import FloatingTOC from './FloatingTOC.svelte';
   import { patchPreviewHtml } from '$lib/utils/dom-patch';
+  import { clearPreviewMatch, highlightPreviewMatch } from '$lib/utils/preview-match';
+  import { RenderService } from '$lib/services/render';
+  import { NavigationService } from '$lib/services/navigation';
+  import { focusMode } from '$lib/stores/ui';
+  import { readingLine } from '$lib/stores/editor-ui';
   import type { EditorRevealRequest } from '$lib/types';
+  import { captureReadingAnchor, restoreReadingAnchor, type ReadingAnchor } from '$lib/utils/reading-anchor';
+  import { notify } from '$lib/services/interaction';
+  import { installFigureControls } from '$lib/utils/figure';
+  import { renderFormula } from '$lib/utils/latex';
 
-  let { content }: { content: string } = $props();
+  let { content, showFloatingOutline = true }: { content: string; showFloatingOutline?: boolean } = $props();
 
   let previewContainer: HTMLDivElement | undefined = $state();
   let latestSelectionText = '';
@@ -16,8 +25,31 @@
   let lastRenderedSessionId: string | null = null;
   let renderRevision = 0;
   let previewScrollTimer: ReturnType<typeof setTimeout> | null = null;
-  let pendingPreviewScroll: { id: string; scrollTop: number } | null = null;
+  let pendingPreviewScroll: { id: string; scrollTop: number; anchor?: ReadingAnchor } | null = null;
   let restoringPreviewScroll = false;
+  let searchRequest: EditorRevealRequest | null = null;
+  let selecting = false;
+  let scrollFrame = 0;
+  let restoreFrame = 0;
+  let queuedPreviewScroll: { id: string | null; scrollTop: number } | null = null;
+  let figureObserver: IntersectionObserver | null = null;
+  const visibleFigures = new WeakSet<Element>();
+
+  function cancelPreviewRestoration(): void {
+    if (restoreFrame) cancelAnimationFrame(restoreFrame);
+    restoreFrame = 0;
+    restoringPreviewScroll = false;
+  }
+
+  function drainPreviewScroll(container = previewContainer): void {
+    if (scrollFrame) {
+      cancelAnimationFrame(scrollFrame);
+      scrollFrame = 0;
+      capturePreviewScroll(queuedPreviewScroll?.id ?? lastRenderedSessionId, false, queuedPreviewScroll?.scrollTop, container);
+    }
+    queuedPreviewScroll = null;
+    flushPreviewScroll();
+  }
 
   function flushPreviewScroll(): void {
     if (previewScrollTimer) {
@@ -25,7 +57,7 @@
       previewScrollTimer = null;
     }
     if (!pendingPreviewScroll) return;
-    updateSessionPreviewScroll(pendingPreviewScroll.id, pendingPreviewScroll.scrollTop);
+    updateSessionPreviewScroll(pendingPreviewScroll.id, pendingPreviewScroll.scrollTop, pendingPreviewScroll.anchor);
     pendingPreviewScroll = null;
   }
 
@@ -39,6 +71,39 @@
   }
 
   function previewInteractions(node: HTMLDivElement) {
+    if (typeof IntersectionObserver !== 'undefined') {
+      figureObserver = new IntersectionObserver(entries => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            visibleFigures.add(entry.target);
+            void renderFigureBlocks(renderRevision, [entry.target as HTMLElement]);
+          } else visibleFigures.delete(entry.target);
+        }
+      }, { root: node, rootMargin: '300px' });
+    }
+    const observer = new ResizeObserver(() => {
+      if (restoringPreviewScroll || selecting || scrollFrame || !node.isConnected || get(activeSessionId) !== lastRenderedSessionId) return;
+      const session = get(sessions).find(item => item.id === lastRenderedSessionId);
+      const pending = pendingPreviewScroll?.id === session?.id ? pendingPreviewScroll : null;
+      restoreReadingAnchor(node, pending?.anchor ?? session?.previewAnchor, pending?.scrollTop ?? session?.previewScrollTop ?? 0);
+    });
+    const mutations = new MutationObserver(() => {
+      observer.disconnect();
+      for (const child of node.children) observer.observe(child);
+    });
+    mutations.observe(node, { childList: true });
+    const startSelection = (event: PointerEvent) => {
+      cancelPreviewRestoration();
+      if (event.button === 0 && event.target instanceof Element && !event.target.closest('a, button, input, select, textarea')) selecting = true;
+    };
+    const endSelection = () => { if (!selecting) return; selecting = false; handlePreviewScroll(); };
+    const userScroll = () => cancelPreviewRestoration();
+    node.addEventListener('pointerdown', startSelection);
+    node.addEventListener('wheel', userScroll, { passive: true });
+    node.addEventListener('touchstart', userScroll, { passive: true });
+    node.addEventListener('keydown', userScroll);
+    window.addEventListener('pointerup', endSelection);
+    window.addEventListener('pointercancel', endSelection);
     node.addEventListener('scroll', handlePreviewScroll);
     node.addEventListener('mouseup', handlePreviewSelection);
     node.addEventListener('keyup', handlePreviewSelection);
@@ -46,6 +111,16 @@
     node.addEventListener('dblclick', handleDoubleClick);
     return {
       destroy() {
+        figureObserver?.disconnect(); figureObserver = null;
+        observer.disconnect(); mutations.disconnect();
+        selecting = false;
+        node.removeEventListener('pointerdown', startSelection);
+        window.removeEventListener('pointerup', endSelection); window.removeEventListener('pointercancel', endSelection);
+        drainPreviewScroll(node);
+        cancelPreviewRestoration();
+        node.removeEventListener('wheel', userScroll);
+        node.removeEventListener('touchstart', userScroll);
+        node.removeEventListener('keydown', userScroll);
         node.removeEventListener('scroll', handlePreviewScroll);
         node.removeEventListener('mouseup', handlePreviewSelection);
         node.removeEventListener('keyup', handlePreviewSelection);
@@ -55,7 +130,6 @@
         highlightSeqId++;
         if (highlightTimer) clearTimeout(highlightTimer);
         pendingHighlights.clear();
-        flushPreviewScroll();
       },
     };
   }
@@ -68,10 +142,13 @@
     const activeId = $activeSessionId;
     const sessionChanged = activeId !== lastRenderedSessionId;
     if (sessionChanged) {
-      flushPreviewScroll();
+      drainPreviewScroll();
+      cancelPreviewRestoration();
+      selecting = false;
       renderRevision++;
       highlightSeqId++;
       pendingHighlights.clear();
+      searchRequest = null;
       restoringPreviewScroll = true;
     }
     const revision = renderRevision;
@@ -82,19 +159,26 @@
       const { changedRoots } = patchPreviewHtml(previewContainer, _content, sessionChanged);
       addCopyButtons(changedRoots);
       handleImages(changedRoots);
+      for (const error of elementsWithin(changedRoots, '.reader-math-error')) {
+        if (error.querySelector('button')) continue;
+        const edit = document.createElement('button'); edit.type = 'button'; edit.textContent = '编辑公式';
+        error.append(edit);
+      }
       void renderLatexBlocks(revision, changedRoots);
-      void renderMermaidBlocks(revision, changedRoots);
+      scheduleFigures(changedRoots);
       highlightCodeBlocks(changedRoots);
       const selectedText = latestSelectionSource === 'editor' ? latestSelectionText : '';
       if (selectedText) highlightSelection(selectedText, false);
+      if (searchRequest && searchRequest.sessionId === activeId) showSearchMatch(searchRequest, false);
     }
 
     if (sessionChanged) {
       const session = get(sessions).find(item => item.id === activeId);
       const nextScrollTop = session?.previewScrollTop ?? 0;
-      requestAnimationFrame(() => {
+      restoreFrame = requestAnimationFrame(() => {
+        restoreFrame = 0;
         if (!previewContainer || get(activeSessionId) !== activeId || revision !== renderRevision) return;
-        previewContainer.scrollTop = Math.min(nextScrollTop, previewContainer.scrollHeight);
+        restoreReadingAnchor(previewContainer, session?.previewAnchor, nextScrollTop);
         restoringPreviewScroll = false;
       });
     }
@@ -105,15 +189,15 @@
     const _theme = $theme;
     if (!previewContainer) return;
     highlightCodeBlocks();
-    void renderMermaidBlocks(renderRevision);
+    scheduleFigures();
   });
 
   // 监听大纲/搜索的行跳转事件
   $effect(() => {
     if (!previewContainer) return;
     const handler = (e: Event) => {
-      const line = (e as CustomEvent).detail?.line;
-      if (line) scrollTo(line);
+      const detail = (e as CustomEvent<{ line: number; sessionId?: string }>).detail;
+      if (detail?.line && (!detail.sessionId || detail.sessionId === get(activeSessionId))) scrollTo(detail.line);
     };
     window.addEventListener('heading-click', handler);
     return () => window.removeEventListener('heading-click', handler);
@@ -123,21 +207,44 @@
     if (!previewContainer) return;
     const handler = (event: Event) => {
       const detail = (event as CustomEvent<EditorRevealRequest>).detail;
-      if (detail?.sessionId === get(activeSessionId)) scrollTo(detail.line);
+      if (detail?.sessionId === get(activeSessionId)) {
+        searchRequest = detail;
+        showSearchMatch(detail);
+      }
     };
+    const clear = () => { searchRequest = null; if (previewContainer) clearPreviewMatch(previewContainer); };
     window.addEventListener('editor-reveal-range', handler);
-    return () => window.removeEventListener('editor-reveal-range', handler);
+    window.addEventListener('preview-search-clear', clear);
+    return () => { window.removeEventListener('editor-reveal-range', handler); window.removeEventListener('preview-search-clear', clear); };
   });
+
+  function showSearchMatch(request: EditorRevealRequest, scroll = true) {
+    if (!previewContainer) return;
+    if (scroll) cancelPreviewRestoration();
+    const node = request.to > request.from ? highlightPreviewMatch(previewContainer, get(fileContent), request.from, request.to,
+      source => RenderService.render(source)) : null;
+    if (scroll) { if (node) node.scrollIntoView({ block: 'center' }); else scrollTo(request.line); }
+  }
 
   async function handlePreviewClick(event: Event) {
     const target = event.target;
     if (!(target instanceof HTMLElement)) return;
+    const mathError = target.closest<HTMLElement>('.reader-math-error');
+    if (mathError) { editFigureSource(mathError); return; }
+    const link = target.closest<HTMLAnchorElement>('a[href]');
+    if (link && previewContainer?.contains(link)) {
+      event.preventDefault();
+      await NavigationService.open(link.getAttribute('href') || '');
+      return;
+    }
 
     const copyButton = target.closest<HTMLButtonElement>('.copy-button');
     if (copyButton && previewContainer?.contains(copyButton)) {
       const codeBlock = copyButton.closest('.code-block') || copyButton.closest('pre');
       const code = codeBlock?.querySelector('code');
       if (!code) return;
+      if (copyButton.disabled) return;
+      copyButton.disabled = true;
       try {
         await navigator.clipboard.writeText(code.textContent || '');
         copyButton.textContent = '已复制';
@@ -146,45 +253,11 @@
         }, 2000);
       } catch (err) {
         console.warn('Copy code failed:', err);
-      }
+        notify('复制代码失败，请检查系统剪贴板权限或手动选择代码。');
+      } finally { if (copyButton.isConnected) copyButton.disabled = false; }
       return;
     }
-
-    if (!(target instanceof HTMLInputElement) || target.type !== 'checkbox') return;
-
-    const li = target.closest('li');
-    if (!li) return;
-
-    // 找到对应的源码行：通过 data-line 或文本匹配
-    const lineAttr = li.getAttribute('data-line');
-    if (lineAttr) {
-      const lineIndex = parseInt(lineAttr);
-      toggleCheckboxInSource(lineIndex);
-    }
-  }
-
-  function toggleCheckboxInSource(lineIndex: number) {
-    const content = $fileContent;
-    const lines = content.split('\n');
-    let lineOffset = lines.slice(0, lineIndex).reduce((offset, line) => offset + line.length + 1, 0);
-
-    // 从 data-line 指示的行附近查找 checkbox
-    for (let i = lineIndex; i < Math.min(lineIndex + 3, lines.length); i++) {
-      const line = lines[i];
-      const marker = line.match(/\[[ xX]\]/);
-      if (marker && marker.index !== undefined) {
-        const from = lineOffset + marker.index;
-        const text = marker[0] === '[ ]' ? '[x]' : '[ ]';
-        window.dispatchEvent(new CustomEvent('editor-replace-range', {
-          detail: {
-            sessionId: get(activeSessionId), expectedContent: content,
-            from, to: from + marker[0].length, text,
-          },
-        }));
-        return;
-      }
-      lineOffset += line.length + 1;
-    }
+    if (target instanceof HTMLInputElement && target.type === 'checkbox') event.preventDefault();
   }
 
   // 双击定位源码行
@@ -215,7 +288,7 @@
   type HighlightJob = { theme: 'light' | 'dark'; sequence: number };
   const pendingHighlights = new Map<Element, HighlightJob>();
   const highlightJobs = new WeakMap<Element, HighlightJob>();
-  const mermaidJobs = new WeakMap<Element, { code: string; theme: 'light' | 'dark' }>();
+  const figureJobs = new WeakMap<Element, { code: string; theme: 'light' | 'dark' }>();
   let highlighting = false;
 
   function elementsWithin(roots: HTMLElement[] | undefined, selector: string): Element[] {
@@ -280,38 +353,67 @@
     }
   }
 
-  // 渲染 Mermaid 图表
-  async function renderMermaidBlocks(revision: number, roots?: HTMLElement[]) {
+  function editFigureSource(container: HTMLElement) {
+    if (!container.isConnected || !previewContainer?.contains(container)) return;
+    const sessionId = get(activeSessionId);
+    const line = Number(container.closest('[data-line]')?.getAttribute('data-line') ?? 0) + 1;
+    setEditorMode('source');
+    window.dispatchEvent(new CustomEvent('heading-click', { detail: { line, sessionId } }));
+  }
+
+  function scheduleFigures(roots?: HTMLElement[]) {
+    for (const element of elementsWithin(roots, '[data-mermaid], [data-chart]')) {
+      if (figureObserver) figureObserver.observe(element);
+      if (!figureObserver || visibleFigures.has(element)) void renderFigureBlocks(renderRevision, [element as HTMLElement]);
+    }
+  }
+
+  async function renderFigureBlocks(revision: number, roots?: HTMLElement[]) {
     if (!previewContainer) return;
-
-    const mermaidContainers = elementsWithin(roots, '.mermaid-container');
-    if (mermaidContainers.length === 0) return;
+    const containers = elementsWithin(roots, '[data-mermaid], [data-chart]');
+    if (containers.length === 0) return;
     const requestedTheme = get(theme);
-
-    try {
-      const { renderMermaid } = await import('$lib/utils/mermaid');
-      if (revision !== renderRevision || !previewContainer || get(theme) !== requestedTheme) return;
-
-      for (const container of mermaidContainers) {
-        if (revision !== renderRevision || !previewContainer || get(theme) !== requestedTheme) return;
-        if (!container.isConnected || !previewContainer.contains(container)) continue;
-        const encodedCode = container.getAttribute('data-mermaid');
-        if (!encodedCode) continue;
-        const previous = mermaidJobs.get(container);
+    for (const node of containers) {
+        const container = node as HTMLElement;
+        if (revision !== renderRevision || !container.isConnected || !previewContainer.contains(container)) continue;
+        const chart = container.hasAttribute('data-chart');
+        const encodedCode = container.getAttribute(chart ? 'data-chart' : 'data-mermaid');
+        if (encodedCode === null) continue;
+        const previous = figureJobs.get(container);
         if (previous?.code === encodedCode && previous.theme === requestedTheme) continue;
         const job = { code: encodedCode, theme: requestedTheme };
-        mermaidJobs.set(container, job);
+        figureJobs.set(container, job);
+        const current = () => revision === renderRevision && figureJobs.get(container) === job
+          && get(theme) === requestedTheme && container.isConnected && !!previewContainer?.contains(container);
+        let code = encodedCode;
         try {
-          const svg = await renderMermaid(decodeURIComponent(encodedCode), requestedTheme);
-          if (revision !== renderRevision || mermaidJobs.get(container) !== job || get(theme) !== requestedTheme || !container.isConnected || !previewContainer?.contains(container)) continue;
+          code = decodeURIComponent(encodedCode);
+          let svg: string;
+          let title = 'Mermaid 图表';
+          let table: (() => string) | undefined;
+          if (chart) {
+            const engine = await import('$lib/utils/data-chart');
+            if (!current()) continue;
+            try {
+              title = engine.parseDataChart(code).title;
+              svg = engine.renderDataChart(code, requestedTheme);
+              table = () => engine.renderChartTable(code);
+            } catch (error) { svg = engine.renderChartError(code, error); }
+          } else {
+            const { renderMermaid } = await import('$lib/utils/mermaid');
+            if (!current()) continue;
+            svg = await renderMermaid(code, requestedTheme);
+          }
+          if (!current()) continue;
           container.innerHTML = svg;
+          installFigureControls(container, { title, source: code, table, edit: () => editFigureSource(container) });
         } catch (error) {
-          if (mermaidJobs.get(container) === job) mermaidJobs.delete(container);
-          console.warn('Mermaid block rendering failed:', error);
+          if (!current()) continue;
+          container.textContent = '图形加载失败，源码仍可编辑。';
+          const pre = document.createElement('pre'); pre.textContent = code; container.append(pre);
+          installFigureControls(container, { title: '图形', source: code, edit: () => editFigureSource(container) });
+          console.warn('Figure rendering failed:', error);
         }
-      }
-    } catch (err) {
-      console.warn('Mermaid rendering failed:', err);
     }
   }
 
@@ -323,7 +425,6 @@
     if (latexContainers.length === 0) return;
 
     try {
-      const katex = await import('katex');
       if (revision !== renderRevision || !previewContainer) return;
 
       for (const container of latexContainers) {
@@ -336,11 +437,7 @@
         try {
           code = decodeURIComponent(encodedCode);
           if (revision !== renderRevision || !container.isConnected) return;
-          katex.default.render(code, container as HTMLElement, {
-            displayMode: true,
-            throwOnError: false,
-            trust: false,
-          });
+          container.innerHTML = renderFormula(code, true);
         } catch (err) {
           const message = err instanceof Error ? err.message : 'LaTeX rendering failed';
           container.innerHTML = `<span class="katex-error" title="${escapeHtml(message)}">${escapeHtml(code)}</span>`;
@@ -420,9 +517,10 @@
 
   function highlightSelection(text: string, scroll = true) {
     if (!previewContainer || !text) return;
+    if (scroll) cancelPreviewRestoration();
     const currentMark = previewContainer.querySelector('mark.selection-highlight');
     if (currentMark?.textContent === text) {
-      if (scroll) currentMark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      if (scroll) currentMark.scrollIntoView({ behavior: scrollBehavior(), block: 'center' });
       return;
     }
     clearSelectionHighlight();
@@ -461,12 +559,15 @@
     if (beforeNode) parent.insertBefore(beforeNode, mark);
     if (afterNode) parent.insertBefore(afterNode, mark.nextSibling);
 
-    if (scroll) mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (scroll) mark.scrollIntoView({ behavior: scrollBehavior(), block: 'center' });
   }
+
+  function scrollBehavior(): ScrollBehavior { return window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'; }
 
   // 滚动到指定位置
   export function scrollTo(line: number) {
     if (!previewContainer) return;
+    cancelPreviewRestoration();
 
     const sourceLine = Math.max(0, line - 1);
     let closest: Element | null = null;
@@ -479,7 +580,7 @@
       }
     }
     if (closest) {
-      closest.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      closest.scrollIntoView({ behavior: scrollBehavior(), block: 'start' });
       return;
     }
 
@@ -492,7 +593,7 @@
       const lines = text.split('\n').length;
 
       if (currentLine + lines >= line) {
-        element.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        element.scrollIntoView({ behavior: scrollBehavior(), block: 'start' });
         break;
       }
 
@@ -513,6 +614,7 @@
   // 设置滚动位置百分比
   export function setScrollPercentage(percentage: number) {
     if (!previewContainer) return;
+    cancelPreviewRestoration();
 
     const scrollHeight = previewContainer.scrollHeight - previewContainer.clientHeight;
     previewContainer.scrollTop = (percentage / 100) * scrollHeight;
@@ -520,10 +622,37 @@
 
   // 预览滚动时同步到 store（编辑器会跟着动）
   function handlePreviewScroll() {
-    if (!previewContainer || restoringPreviewScroll) return;
-    const activeId = get(activeSessionId);
-    if (!activeId || activeId !== lastRenderedSessionId) return;
-    pendingPreviewScroll = { id: activeId, scrollTop: previewContainer.scrollTop };
+    queuedPreviewScroll = { id: lastRenderedSessionId, scrollTop: previewContainer?.scrollTop ?? 0 };
+    if (!scrollFrame) scrollFrame = requestAnimationFrame(() => {
+      scrollFrame = 0;
+      const queued = queuedPreviewScroll;
+      queuedPreviewScroll = null;
+      if (queued) capturePreviewScroll(queued.id, true, queued.scrollTop);
+    });
+  }
+
+  function capturePreviewScroll(id = get(activeSessionId), publishLine = true, queuedTop?: number, container = previewContainer) {
+    if (!container || restoringPreviewScroll) return;
+    if (!id || id !== lastRenderedSessionId) return;
+    const session = get(sessions).find(item => item.id === id);
+    if (!session) return;
+    if (publishLine && id === get(activeSessionId) && container.isConnected) {
+      const top = container.getBoundingClientRect().top + 80;
+      let line = 1;
+      for (const node of container.querySelectorAll<HTMLElement>('[data-line]')) {
+        if (node.getBoundingClientRect().top > top) break;
+        const mapped = Number(node.dataset.line);
+        if (Number.isInteger(mapped) && mapped >= 0) line = mapped + 1;
+      }
+      readingLine.set(line);
+    }
+    const scrollTop = container.isConnected ? container.scrollTop : queuedTop ?? container.scrollTop;
+    const previous = pendingPreviewScroll?.id === id ? pendingPreviewScroll : null;
+    const oldAnchor = previous?.anchor ?? session.previewAnchor;
+    // Detached DOM has no usable rectangles; carry the last anchor by the queued scroll delta.
+    const anchor = container.isConnected ? captureReadingAnchor(container)
+      : oldAnchor ? { ...oldAnchor, offset: oldAnchor.offset + scrollTop - (previous?.scrollTop ?? session.previewScrollTop ?? 0) } : undefined;
+    pendingPreviewScroll = { id, scrollTop, anchor };
     if (previewScrollTimer) clearTimeout(previewScrollTimer);
     previewScrollTimer = setTimeout(() => {
       previewScrollTimer = null;
@@ -533,6 +662,12 @@
 
   function handlePreviewSelection() {
     if (!previewContainer) return;
+    if (get(focusMode)) {
+      previewContainer.querySelectorAll('.preview-focus-block').forEach(node => node.classList.remove('preview-focus-block'));
+      const anchor = window.getSelection()?.anchorNode;
+      const element = anchor instanceof Element ? anchor : anchor?.parentElement;
+      element?.closest('p, li, pre, table, blockquote, h1, h2, h3, h4, h5, h6, .katex-display, .mermaid-container')?.classList.add('preview-focus-block');
+    }
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed) {
       selectionText.set('');
@@ -580,14 +715,16 @@
   });
 </script>
 
-<div class="preview-wrapper">
-  <FloatingTOC />
+<div class="preview-wrapper" class:focus-mode={$focusMode}>
+  {#if showFloatingOutline}<FloatingTOC />{/if}
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable reading content needs keyboard scrolling and restored search focus.) -->
   <div
     bind:this={previewContainer}
     use:previewInteractions
     class="preview-container markdown-body"
     role="document"
     aria-label="Markdown 预览"
+    tabindex="0"
   ></div>
 
   {#if !content}
@@ -624,7 +761,7 @@
     overflow-y: auto;
     font-family: var(--font-content);
     line-height: var(--reader-line-height, var(--doc-line-height, 1.75));
-    padding-top: 64px;
+    padding-top: 48px;
     padding-bottom: 60vh;
     padding-left: max(34px, calc((100% - var(--doc-content-width, 760px)) / 2));
     padding-right: max(34px, calc((100% - var(--doc-content-width, 760px)) / 2));
@@ -660,8 +797,8 @@
   }
 
   .preview-container :global(.katex-error) {
-    color: #cc0000;
-    background: #fff5f5;
+    color: var(--syntax-error);
+    background: color-mix(in srgb, var(--syntax-error) 8%, var(--doc-code-bg));
     padding: 0.2em 0.4em;
     border-radius: 3px;
     font-family: monospace;
@@ -779,12 +916,4 @@
     margin: 2em 0;
   }
 
-  .preview-container :global(.task-list-item) {
-    list-style: none;
-    margin-left: -1.5em;
-  }
-
-  .preview-container :global(.task-list-item input) {
-    margin-right: 0.5em;
-  }
 </style>

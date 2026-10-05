@@ -1,37 +1,67 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onDestroy, tick } from 'svelte';
+  import { get } from 'svelte/store';
   import { fileTree, toggleNode, loadNodeChildren, currentDirectory, currentDirectoryHandle, directoryName, refreshDirectory } from '$lib/stores/file';
   import {
     currentFile,
-    fileContent,
-    createSession,
-    updateActiveSessionFileHandle,
+    activeSessionId,
   } from '$lib/stores/document';
-  import { readFile, isFileSystemAccessSupported, renameItem, deleteItem } from '$lib/utils/native-fs';
+  import { isFileSystemAccessSupported, renameItem, deleteItem } from '$lib/utils/native-fs';
   import { isTauri } from '$lib/utils/platform';
-  import { setCurrentFileDir } from '$lib/utils/markdown';
   import FileTree from './FileTree.svelte';
   import Outline from './Outline.svelte';
-  import GlobalSearch from './GlobalSearch.svelte';
   import GlobalFileSearch from './GlobalFileSearch.svelte';
 
   import { WorkspaceService } from '$lib/services/workspace';
   import { renameSessionPaths } from '$lib/stores/document';
   import { DocumentService } from '$lib/services/document';
   import { joinPath, parentPath } from '$lib/utils/path';
+  import { filterFileTree } from '$lib/utils/file-tree-filter';
+  import { notify } from '$lib/services/interaction';
+  import { WorkspaceIndex } from '$lib/services/workspace-index';
 
   let searchQuery = $state('');
-  let isSearching = $state(false);
-  let originalTree: any[] = [];
-  let isSearchActive = $state(false);
   let showFileSearch = $state(false);
+  let isRefreshing = $state(false);
+  let filterInput: HTMLInputElement | undefined = $state();
+  let collapsedMatches = $state<Set<string>>(new Set());
+  const filteredTree = $derived(filterFileTree($fileTree, searchQuery, collapsedMatches));
+  $effect(() => { void searchQuery; collapsedMatches = new Set(); });
+  let openRevision = 0;
+  onDestroy(() => { openRevision++; });
+  $effect(() => { void $currentDirectory; void $currentDirectoryHandle; searchQuery = ''; openRevision++; });
 
   // 侧边栏选项卡
   type SidebarTab = 'files' | 'outline' | 'search';
-  let activeTab: SidebarTab = $state('files');
+  let { activeTab = $bindable('files') }: { activeTab?: SidebarTab } = $props();
 
   function switchTab(tab: SidebarTab) {
     activeTab = tab;
+  }
+  function navigateTabs(event: KeyboardEvent) {
+    const tabs: SidebarTab[] = ['files', 'outline', 'search'];
+    const index = tabs.indexOf(activeTab);
+    const next = event.key === 'ArrowRight' ? (index + 1) % tabs.length
+      : event.key === 'ArrowLeft' ? (index + tabs.length - 1) % tabs.length
+      : event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : -1;
+    if (next < 0 || !(event.target instanceof Element) || event.target.getAttribute('role') !== 'tab') return;
+    event.preventDefault(); switchTab(tabs[next]);
+    document.getElementById(`sidebar-tab-${tabs[next]}`)?.focus();
+  }
+  function toggleFilter() {
+    if (showFileSearch) { searchQuery = ''; showFileSearch = false; }
+    else { showFileSearch = true; void tick().then(() => filterInput?.focus()); }
+  }
+  async function refreshFiles() {
+    if (isRefreshing) return;
+    isRefreshing = true;
+    try { await refreshDirectory(); WorkspaceIndex.invalidate(); } finally { isRefreshing = false; }
+  }
+  function toggleFilteredNode(node: Parameters<typeof toggleNode>[0]) {
+    if (!searchQuery.trim()) { toggleNode(node); return; }
+    const next = new Set(collapsedMatches);
+    if (next.has(node.path)) next.delete(node.path); else next.add(node.path);
+    collapsedMatches = next;
   }
 
   // 大纲点击跳转
@@ -45,78 +75,28 @@
   // 打开文件夹
   async function openFolder() {
     if (!isTauri() && !isFileSystemAccessSupported()) {
-      alert('您的浏览器不支持打开文件夹功能。\n\n请使用 Chrome/Edge 86+ 浏览器，或直接拖放文件到编辑器中。');
+      notify('您的浏览器不支持打开文件夹，请使用 Chrome/Edge 或拖放文件到编辑器。');
       return;
     }
 
-    if (await WorkspaceService.openFolder()) {
-      originalTree = [];
-      isSearchActive = false;
-    }
+    await WorkspaceService.openFolder();
   }
 
   // 打开文件
-  async function openFile(path: string) {
-    try {
-      if (isTauri()) {
-        // Tauri 模式：直接使用路径读取
-        const rootPath = $currentDirectory;
-        if (!rootPath) {
-          alert('请先打开文件夹');
-          return;
-        }
-        const fullPath = path.startsWith('/') || path.includes(':') ? path : `${rootPath}/${path}`;
-        const content = await readFile(fullPath);
-        createSession(path.split(/[/\\]/).pop() || path, fullPath, content);
-        
-        // 同步图片目录上下文
-        const sep = fullPath.includes('\\') ? '\\' : '/';
-        const dir = fullPath.split(sep);
-        dir.pop();
-        setCurrentFileDir(dir.join(sep));
-      } else {
-        // 浏览器模式：使用文件句柄
-        if (!$currentDirectoryHandle) {
-          alert('请先打开文件夹');
-          return;
-        }
-        const handle = await findFileHandle(path);
-        if (!handle) {
-          alert('找不到文件: ' + path);
-          return;
-        }
-        const content = await readFile(handle);
-        createSession(path.split(/[/\\]/).pop() || path, path, content, content, handle);
-        updateActiveSessionFileHandle(handle);
-      }
-    } catch (error: any) {
-      console.error('Failed to open file:', error);
-      alert('打开文件失败: ' + error.message);
+  async function openFile(path: string, line?: number) {
+    const request = ++openRevision;
+    const root = get(currentDirectory);
+    const handle = get(currentDirectoryHandle);
+    const origin = get(activeSessionId);
+    const stillCurrent = () => request === openRevision && root === get(currentDirectory)
+      && handle === get(currentDirectoryHandle) && origin === get(activeSessionId);
+    const fullPath = isTauri() && root && !/^[a-zA-Z]:[\\/]|^[\\/]/.test(path) ? joinPath(root, path) : path;
+    const id = await DocumentService.openPath(fullPath, stillCurrent);
+    if (!id || request !== openRevision || id !== get(activeSessionId) || !line) return;
+    await tick();
+    if (request === openRevision && id === get(activeSessionId)) {
+      window.dispatchEvent(new CustomEvent('heading-click', { detail: { sessionId: id, line } }));
     }
-  }
-
-  // 查找文件句柄（浏览器模式）
-  async function findFileHandle(path: string): Promise<FileSystemFileHandle | null> {
-    const parts = path.split('/').filter(p => p);
-    let current: FileSystemDirectoryHandle | null = $currentDirectoryHandle;
-
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i];
-      const isLast = i === parts.length - 1;
-
-      try {
-        if (isLast) {
-          if (!current?.getFileHandle) return null;
-          return await current.getFileHandle(part);
-        }
-        if (!current?.getDirectoryHandle) return null;
-        current = await current.getDirectoryHandle(part);
-      } catch (error) {
-        return null;
-      }
-    }
-
-    return null;
   }
 
   async function findDirectoryHandle(path: string): Promise<FileSystemDirectoryHandle | null> {
@@ -151,9 +131,10 @@
       }
       renameSessionPaths(oldPath, newPath);
       await refreshDirectory();
+      WorkspaceIndex.invalidate();
     } catch (error: any) {
       console.error('Failed to rename:', error);
-      alert('重命名失败: ' + error.message);
+      notify('重命名失败: ' + error.message);
     }
   }
 
@@ -173,68 +154,24 @@
       });
       if (!deleted) return;
       await refreshDirectory();
+      WorkspaceIndex.invalidate();
     } catch (error: any) {
       console.error('Failed to delete:', error);
-      alert('删除失败: ' + error.message);
+      notify('删除失败: ' + error.message);
     }
-  }
-
-  // 搜索文件
-  async function searchFiles() {
-    if (!searchQuery.trim() || !$currentDirectory) return;
-
-    if (!isSearchActive) {
-      originalTree = $fileTree;
-      isSearchActive = true;
-    }
-
-    isSearching = true;
-    try {
-      // 在当前文件树中搜索
-      const results = searchInTree(originalTree, searchQuery.toLowerCase());
-      fileTree.set(results);
-    } catch (error) {
-      console.error('Failed to search files:', error);
-    } finally {
-      isSearching = false;
-    }
-  }
-
-  // 在文件树中搜索
-  function searchInTree(tree: any[], query: string): any[] {
-    const results: any[] = [];
-
-    for (const node of tree) {
-      if (node.name.toLowerCase().includes(query)) {
-        results.push(node);
-      }
-
-      if (node.children) {
-        const childResults = searchInTree(node.children, query);
-        results.push(...childResults);
-      }
-    }
-
-    return results;
   }
 
   // 清除搜索
   function clearSearch() {
     searchQuery = '';
     showFileSearch = false;
-    if (isSearchActive) {
-      fileTree.set(originalTree);
-      originalTree = [];
-      isSearchActive = false;
-    }
+    document.querySelector<HTMLElement>('[aria-label="筛选文件名"]')?.focus();
   }
 
   // 键盘快捷键
   function handleKeydown(event: KeyboardEvent) {
-    if (event.key === 'Enter') {
-      searchFiles();
-    }
     if (event.key === 'Escape') {
+      event.preventDefault(); event.stopPropagation();
       clearSearch();
     }
   }
@@ -247,19 +184,21 @@
   aria-label="文件浏览器"
 >
   <!-- Drawer tabs -->
-  <div class="sidebar-drawer-tabs">
+  <div class="sidebar-drawer-tabs" role="tablist" aria-label="侧栏视图" tabindex="-1" onkeydown={navigateTabs}>
     <button
       class="sidebar-tab"
+      role="tab" id="sidebar-tab-files" aria-selected={activeTab === 'files'} aria-controls="sidebar-panel" tabindex={activeTab === 'files' ? 0 : -1}
       class:active={activeTab === 'files'}
       onclick={() => switchTab('files')}
     >
       <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
       </svg>
-      Files
+      文件
     </button>
     <button
       class="sidebar-tab"
+      role="tab" id="sidebar-tab-outline" aria-selected={activeTab === 'outline'} aria-controls="sidebar-panel" tabindex={activeTab === 'outline' ? 0 : -1}
       class:active={activeTab === 'outline'}
       onclick={() => switchTab('outline')}
     >
@@ -271,10 +210,11 @@
         <line x1="3" y1="12" x2="3.01" y2="12"></line>
         <line x1="3" y1="18" x2="3.01" y2="18"></line>
       </svg>
-      Outline
+      大纲
     </button>
     <button
       class="sidebar-tab"
+      role="tab" id="sidebar-tab-search" aria-selected={activeTab === 'search'} aria-controls="sidebar-panel" tabindex={activeTab === 'search' ? 0 : -1}
       class:active={activeTab === 'search'}
       onclick={() => switchTab('search')}
     >
@@ -282,41 +222,34 @@
         <circle cx="11" cy="11" r="8"></circle>
         <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
       </svg>
-      Search
+      搜索
     </button>
     <div class="flex-1"></div>
-    {#if activeTab === 'files'}
-      <button
-        class="toolbar-button"
-        onclick={openFolder}
-        title="打开文件夹"
-      >
-        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <line x1="12" y1="5" x2="12" y2="19"></line>
-          <line x1="5" y1="12" x2="19" y2="12"></line>
-        </svg>
-      </button>
-    {/if}
   </div>
 
+  <div class="sidebar-panel" id="sidebar-panel" role="tabpanel" aria-labelledby={`sidebar-tab-${activeTab}`}>
   {#if activeTab === 'files'}
     <div class="file-panel-bar">
       <button
         type="button"
         class="folder-label"
         onclick={openFolder}
-        title={$currentDirectory || 'Open folder'}
+        title={$currentDirectory || '打开文件夹'}
       >
         <span class="folder-marker" aria-hidden="true"></span>
-        <span>{$directoryName || $currentDirectory || 'Open folder'}</span>
+        <span>{$directoryName || $currentDirectory || '打开文件夹'}</span>
+      </button>
+      <button type="button" class="panel-icon-button" onclick={refreshFiles} disabled={!$currentDirectory || isRefreshing}
+        aria-label="刷新文件树" aria-busy={isRefreshing} title="刷新文件树（保留当前筛选）">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M20 12a8 8 0 0 0-14-5M4 12a8 8 0 0 0 14 5" /></svg>
       </button>
       <button
         type="button"
         class="panel-icon-button"
         class:active={showFileSearch}
-        onclick={() => (showFileSearch = !showFileSearch)}
-        aria-label="Find in library"
-        title="Find in library"
+        onclick={toggleFilter}
+        aria-label="筛选文件名"
+        title="筛选文件名"
       >
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="11" cy="11" r="8"></circle>
@@ -325,14 +258,16 @@
       </button>
     </div>
 
-    {#if showFileSearch || searchQuery || isSearchActive}
+    {#if showFileSearch}
     <!-- 搜索框 -->
     <div class="p-2 border-b border-[var(--border-color)]">
       <div class="search-box">
         <input
+          bind:this={filterInput}
           type="text"
           class="search-input"
           placeholder="搜索文件..."
+          aria-label="筛选文件名"
           bind:value={searchQuery}
           onkeydown={handleKeydown}
         />
@@ -344,14 +279,15 @@
             </svg>
           </button>
         {:else}
-          <button class="toolbar-button" onclick={searchFiles} title="搜索">
+          <span class="filter-icon" aria-hidden="true">
             <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="11" cy="11" r="8"></circle>
               <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
             </svg>
-          </button>
+          </span>
         {/if}
       </div>
+      <p class="filter-hint">筛选已载入的目录项</p>
     </div>
 
     <!-- 文件树 -->
@@ -360,18 +296,16 @@
     <div class="flex-1 overflow-auto">
       {#if $currentDirectory}
         <div class="p-2">
-          <div class="text-xs text-[var(--text-tertiary)] mb-2 px-2">
-            {$directoryName || $currentDirectory}
-          </div>
           <FileTree
-            nodes={$fileTree}
-            onFileClick={openFile}
-            onToggle={toggleNode}
+            nodes={filteredTree}
+            onFileClick={path => { void openFile(path); }}
+            onToggle={toggleFilteredNode}
             onLoadChildren={loadNodeChildren}
             onRename={handleRename}
             onDelete={handleDelete}
             activePath={$currentFile}
           />
+          {#if searchQuery.trim() && !filteredTree.length}<p class="file-tree-empty" role="status">没有匹配的文件</p>{/if}
         </div>
       {:else}
         <div class="flex flex-col items-center justify-center h-full text-[var(--text-tertiary)] p-4">
@@ -399,18 +333,17 @@
   {:else if activeTab === 'search'}
     <!-- 全局文件搜索 -->
     <div class="flex-1 overflow-auto">
-      <GlobalFileSearch onFileSelect={(path, line) => {
-        openFile(path);
-        setTimeout(() => {
-          const event = new CustomEvent('heading-click', { detail: { line } });
-          window.dispatchEvent(event);
-        }, 100);
-      }} />
+      <GlobalFileSearch onFileSelect={(path, line) => { void openFile(path, line); }} />
     </div>
   {/if}
+  </div>
 </div>
 
 <style>
+  .sidebar-panel { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+  .filter-hint, .file-tree-empty { margin: 5px 4px 0; color: var(--ui-text-muted); font-size: 11px; }
+  .file-tree-empty { padding: 12px 4px; }
+  .filter-icon { display: inline-flex; padding: 4px; color: var(--ui-text-muted); }
   .file-panel-bar {
     display: flex;
     align-items: center;
@@ -433,7 +366,7 @@
     background: transparent;
     color: var(--ui-text-muted);
     cursor: pointer;
-    font-size: 11px;
+    font-size: 12px;
     text-align: left;
   }
 
@@ -478,27 +411,29 @@
     color: var(--ui-text);
     opacity: 1;
   }
+  .panel-icon-button:disabled { opacity: 0.35; cursor: default; }
 
   .sidebar-tab {
     display: flex;
     align-items: center;
     gap: 4px;
-    padding: 4px 7px;
+    padding: 4px 6px;
     margin: 3px 1px;
     border: none;
     border-radius: 4px;
     background: transparent;
     color: var(--ui-text-muted);
     cursor: pointer;
-    font-size: 11px;
+    font-size: 12px;
+    flex-shrink: 0;
     font-weight: 400;
-    transition: all 0.15s;
+    transition: color 0.12s, background-color 0.12s;
   }
 
   .sidebar-drawer-tabs {
     display: flex;
     align-items: center;
-    min-height: 34px;
+    min-height: 40px;
     padding: 0 34px 0 8px;
     border-bottom: 1px solid color-mix(in srgb, var(--ui-border) 66%, transparent);
   }

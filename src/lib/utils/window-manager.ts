@@ -4,14 +4,16 @@
  */
 
 import { isTauri } from './platform';
+import { waitForWindowCreation } from './window-creation';
+import { notify } from '$lib/services/interaction';
 
 /**
  * 在新窗口中打开文件
  */
 export async function openInNewWindow(filePath: string): Promise<boolean> {
   if (!isTauri()) {
-    // 浏览器模式：打开新标签
-    return window.open(`/?file=${encodeURIComponent(filePath)}`, '_blank') !== null;
+    notify('新窗口打开仅支持桌面版；浏览器新标签无法继承文件授权。');
+    return false;
   }
 
   try {
@@ -29,29 +31,11 @@ export async function openInNewWindow(filePath: string): Promise<boolean> {
       resizable: true,
     });
 
-    return await new Promise<boolean>((resolve) => {
-      let settled = false;
-      const finish = (result: boolean) => {
-        if (settled) return;
-        settled = true;
-        resolve(result);
-      };
-      void webview.once('tauri://created', () => finish(true));
-      void webview.once('tauri://error', (event) => {
-        console.error('Failed to create window:', event);
-        alert(`无法创建新窗口: ${String(event.payload)}`);
-        finish(false);
-      });
-      setTimeout(() => {
-        if (!settled) {
-          alert('创建新窗口超时，请重试。');
-          finish(false);
-        }
-      }, 10_000);
-    });
+    await waitForWindowCreation(webview);
+    return true;
   } catch (err) {
     console.error('Failed to open new window:', err);
-    alert(`无法创建新窗口: ${err instanceof Error ? err.message : String(err)}`);
+    notify(`无法创建新窗口：${err instanceof Error ? err.message : String(err)}`);
     return false;
   }
 }

@@ -33,6 +33,7 @@ async function exportDownload(page: Page, label: string): Promise<Download> {
   await expect(item).toBeVisible();
   const download = page.waitForEvent('download');
   await item.click();
+  if (label === 'Word (DOCX)') await page.getByRole('dialog', { name: 'DOCX 公式兼容性' }).getByRole('button', { name: '继续导出', exact: true }).click();
   return await download;
 }
 
@@ -57,7 +58,6 @@ test('exports a standalone sanitized HTML document', async ({ page }) => {
 });
 
 test('exports real DOCX and EPUB ZIP containers', async ({ page }) => {
-  page.once('dialog', dialog => dialog.accept());
   const docx = await exportDownload(page, 'Word (DOCX)');
   const docxBytes = await downloadBytes(docx);
   expect(docx.suggestedFilename()).toBe('未命名.docx');
@@ -121,4 +121,5 @@ test('builds printable PDF content and invokes the print flow', async ({ page })
   expect(html).toContain('<!DOCTYPE html>');
   expect(html).toContain('Export Heading');
   expect(dialogs).toEqual([]);
+  await expect(page.getByText('已打开打印对话框，请在其中选择保存为 PDF；Reader 无法确认是否保存成功。', { exact: true })).toBeVisible();
 });

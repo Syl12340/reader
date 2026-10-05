@@ -1,6 +1,6 @@
 import { parseFrontmatter, renderFrontmatterCard } from '../utils/frontmatter';
 import { prepareLatex, restoreLatex } from '../utils/latex';
-import { renderMarkdown } from '../utils/markdown';
+import { renderMarkdown, renderInlineMarkdown } from '../utils/markdown';
 
 export class RenderService {
   /**
@@ -17,12 +17,17 @@ export class RenderService {
     const { cleaned, map } = prepareLatex(body);
 
     // 阶段 2：markdown-it 渲染为 HTML (默认带有 data-line 行号属性)
-    const html = renderMarkdown(cleaned, config.filePath ?? null);
+    const lineOffset = content.slice(0, content.length - body.length).split('\n').length - 1;
+    const html = renderMarkdown(cleaned, config.filePath ?? null, content, lineOffset);
 
     // 阶段 3：还原 LaTeX 占位符为 KaTeX HTML
     const finalHtml = restoreLatex(html, map);
 
     // 合并并返回
     return cardHtml ? cardHtml + finalHtml : finalHtml;
+  }
+  static inline(content: string, filePath: string | null = null): string {
+    const { cleaned, map } = prepareLatex(content);
+    return restoreLatex(renderInlineMarkdown(cleaned, filePath), map);
   }
 }

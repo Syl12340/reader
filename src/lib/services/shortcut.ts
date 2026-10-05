@@ -54,6 +54,18 @@ const DEFAULT_SHORTCUTS: ShortcutDefinition[] = [
   { id: 'commandPalette', key: 'Ctrl+Shift+P' },
   { id: 'settings', key: 'Ctrl+,' },
   { id: 'exit', key: 'Ctrl+Q' },
+  { id: 'quickOpen', key: 'Ctrl+Shift+O' },
+  { id: 'nextTab', key: 'Ctrl+Tab' },
+  { id: 'previousTab', key: 'Ctrl+Shift+Tab' },
+  { id: 'reopenTab', key: 'Ctrl+Shift+T' },
+  { id: 'closeTab', key: 'Ctrl+W' },
+  { id: 'navigateBack', key: 'Alt+Left' },
+  { id: 'navigateForward', key: 'Alt+Right' },
+  { id: 'focusMode', key: 'F8' },
+  { id: 'typewriterMode', key: 'F9' },
+  { id: 'zoomIn', key: 'Ctrl+=' },
+  { id: 'zoomOut', key: 'Ctrl+-' },
+  { id: 'zoomReset', key: 'Ctrl+0' },
 ];
 export const shortcutBindings = writable<ShortcutDefinition[]>(DEFAULT_SHORTCUTS.map(s => ({ ...s })));
 
@@ -142,7 +154,7 @@ class ShortcutManager {
 
     const matched = this.shortcuts.find(s => s.key === keyStr);
     // Keep native text-field editing and CodeMirror history handling local.
-    if (matched && ['undo', 'redo', 'bold', 'italic', 'link', 'code'].includes(matched.id)
+    if (matched && ['undo', 'redo', 'bold', 'italic', 'strikethrough', 'link', 'code', 'h1', 'h2', 'quote'].includes(matched.id)
       && target?.closest('input, textarea, [contenteditable="true"]:not(.cm-content)')) return;
     if (matched && this.handlers[matched.id]) {
       e.preventDefault();

@@ -35,15 +35,16 @@ async function createNewDocument(page: import('@playwright/test').Page) {
 }
 
 test.beforeEach(async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem('showSingleTab', 'true'));
   await page.goto('/');
   await createNewDocument(page);
 });
 
 test('uses a paper-first shell with drawer navigation and Write Source Read views', async ({ page }) => {
   await expect(page.locator('.sidebar-drawer')).toHaveCount(0);
-  await expect(page.getByRole('button', { name: 'Open library drawer' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '显示侧栏' })).toBeVisible();
 
-  await page.getByRole('button', { name: 'Open library drawer' }).click();
+  await page.getByRole('button', { name: '显示侧栏' }).click();
   await expect(page.locator('.sidebar-drawer')).toBeVisible();
   const sidebarPresentation = await page.locator('.sidebar-drawer').evaluate(element => {
     const style = getComputedStyle(element);
@@ -62,18 +63,18 @@ test('uses a paper-first shell with drawer navigation and Write Source Read view
   expect(sidebarPresentation.boxShadow).toBe('none');
   expect(sidebarPresentation.left).toBe(0);
   expect(sidebarPresentation.height).toBeGreaterThan(sidebarPresentation.viewportHeight - 90);
-  await expect(page.getByRole('button', { name: 'Files', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Outline', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Search', exact: true })).toBeVisible();
+  await expect(page.getByRole('tab', { name: '文件', exact: true })).toBeVisible();
+  await expect(page.getByRole('tab', { name: '大纲', exact: true })).toBeVisible();
+  await expect(page.getByRole('tab', { name: '搜索', exact: true })).toBeVisible();
 
-		await page.getByRole('button', { name: 'Hide library sidebar' }).click();
+  await page.locator('.toolbar').getByRole('button', { name: '隐藏侧栏' }).click();
   await expect(page.locator('.sidebar-drawer')).toHaveCount(0);
 
   const editor = page.locator('.cm-content');
   await editor.click();
   await page.keyboard.insertText('# Shell\n\nA quiet paragraph.');
 
-  await page.getByRole('button', { name: 'Source', exact: true }).click();
+  await page.getByRole('button', { name: '源码', exact: true }).click();
   await expect(page.locator('[data-editor-mode="source"]')).toBeVisible();
   await expect(page.locator('.cm-gutters .cm-lineNumbers')).toBeVisible();
   const modeSwitcherPlacement = await page.locator('.status-mode-switcher').evaluate(element => {
@@ -87,7 +88,7 @@ test('uses a paper-first shell with drawer navigation and Write Source Read view
   expect(modeSwitcherPlacement.position).toBe('static');
   expect(modeSwitcherPlacement.left).toBeGreaterThan(modeSwitcherPlacement.viewportWidth * 0.55);
 
-  await page.getByRole('button', { name: 'Read', exact: true }).click();
+  await page.getByRole('button', { name: '阅读', exact: true }).click();
   await expect(page.locator('.preview-container')).toContainText('Shell');
   const readPresentation = await page.locator('.preview-container').evaluate(element => {
     const style = getComputedStyle(element);
@@ -101,7 +102,7 @@ test('uses a paper-first shell with drawer navigation and Write Source Read view
   expect(readPresentation.lineHeight).toBeGreaterThan(24);
   expect(readPresentation.fontFamily).not.toMatch(/monospace|Consolas|JetBrains Mono|Cascadia Code/i);
 
-  await page.getByRole('button', { name: 'Write', exact: true }).click();
+  await page.getByRole('button', { name: '写作', exact: true }).click();
   await expect(page.locator('[data-editor-mode="wysiwym"]')).toBeVisible();
 });
 
@@ -117,7 +118,7 @@ test('does not overlay the empty placeholder on a single-line document', async (
   expect(writeBeforeContent).not.toContain('开始写作');
   expect(writeBeforeContent).not.toContain('Start writing');
 
-  await page.getByRole('button', { name: 'Source', exact: true }).click();
+  await page.getByRole('button', { name: '源码', exact: true }).click();
   await expect(page.locator('[data-editor-mode="source"]')).toBeVisible();
   const sourceBeforeContent = await page.locator('.cm-line').first().evaluate(element =>
     getComputedStyle(element, '::before').content,
@@ -153,7 +154,7 @@ test('keeps document state across editor modes', async ({ page }) => {
   expect(immersiveHeading.textDecoration).toBe('none');
   expect(immersiveHeading.fontWeight).toBeGreaterThanOrEqual(600);
 
-  await page.getByRole('button', { name: 'Source' }).click();
+  await page.getByRole('button', { name: '源码', exact: true }).click();
   await expect(page.locator('[data-editor-mode="source"]')).toBeVisible();
   await expect(page.locator('.cm-content')).toContainText('const answer = 42;');
   await expect(page.locator('.cm-content')).toContainText('**bold**');
@@ -196,10 +197,10 @@ test('keeps document state across editor modes', async ({ page }) => {
   expect(sourceViewportPresentation.every(item => item.textDecoration === 'none')).toBe(true);
   expect(sourceViewportPresentation.every(item => item.textTransform === 'none')).toBe(true);
 
-  await page.getByRole('button', { name: 'Read', exact: true }).click();
+  await page.getByRole('button', { name: '阅读', exact: true }).click();
   await expect(page.locator('.preview-container')).toContainText('Heading');
 
-  await page.getByRole('button', { name: 'Write' }).click();
+  await page.getByRole('button', { name: '写作' }).click();
   await expect(page.locator('[data-editor-mode="wysiwym"]')).toBeVisible();
   await expect(page.locator('.cm-task-widget')).toBeVisible();
 });
@@ -213,7 +214,7 @@ test('updates task source through a CodeMirror transaction', async ({ page }) =>
   const checkbox = page.locator('.cm-task-widget');
   await expect(checkbox).toBeVisible();
   await checkbox.check();
-  await page.getByRole('button', { name: 'Source' }).click();
+  await page.getByRole('button', { name: '源码', exact: true }).click();
   await expect(page.locator('.cm-content')).toContainText('[x] task');
   await page.keyboard.press('Control+z');
   await expect(page.locator('.cm-content')).toContainText('[ ] task');
@@ -237,9 +238,9 @@ test('opens slash menu and edits a table widget', async ({ page }) => {
   await expect(editTable).toBeVisible();
   await editTable.click();
   await expect(page.getByRole('dialog', { name: '表格编辑器' })).toBeVisible();
-  await page.getByLabel('第 1 行第 1 列').fill('beta');
+  await page.getByRole('dialog', { name: '表格编辑器' }).getByRole('textbox', { name: '第 1 行第 1 列', exact: true }).fill('beta');
   await page.getByRole('button', { name: '应用' }).click();
-  await page.getByRole('button', { name: 'Source' }).click();
+  await page.getByRole('button', { name: '源码', exact: true }).click();
   await expect(page.locator('.cm-content')).toContainText('| beta | 1 |');
 });
 
@@ -261,7 +262,7 @@ test('restores cursor, history, mode, and widgets after tab switches', async ({ 
   await editor.click();
   await page.keyboard.insertText(sample);
   await page.keyboard.press('Control+Home');
-  await page.getByRole('button', { name: 'Source' }).click();
+  await page.getByRole('button', { name: '源码', exact: true }).click();
 
   await page.keyboard.press('Control+n');
   await page.locator('.cm-content').click();
@@ -276,7 +277,7 @@ test('restores cursor, history, mode, and widgets after tab switches', async ({ 
   await page.keyboard.press('Control+z');
   await expect(page.locator('.cm-content')).not.toContainText('X# Heading');
 
-  await page.getByRole('button', { name: 'Write' }).click();
+  await page.getByRole('button', { name: '写作' }).click();
   await page.keyboard.press('Control+Home');
   await expect(page.locator('.cm-task-widget')).toBeVisible();
 });
@@ -335,8 +336,8 @@ test('accepts input and switches modes in a 500KB document', async ({ page }) =>
   await page.keyboard.insertText('-marker');
   await expect(page.locator('.cm-content')).toContainText('tail-marker');
 
-  await page.getByRole('button', { name: 'Source' }).click();
-  await page.getByRole('button', { name: 'Write' }).click();
+  await page.getByRole('button', { name: '源码', exact: true }).click();
+  await page.getByRole('button', { name: '写作' }).click();
   await expect(page.locator('[data-editor-mode="wysiwym"]')).toBeVisible();
   await expect(page.locator('.cm-content')).toContainText('tail-marker');
 });
@@ -359,7 +360,7 @@ test('uses one scroll container and renders the current viewport after mode swit
   await page.keyboard.insertText(longDocument);
   await page.keyboard.press('Control+End');
 
-  await page.getByRole('button', { name: 'Source', exact: true }).click();
+  await page.getByRole('button', { name: '源码', exact: true }).click();
   await expect(page.locator('.cm-gutters .cm-lineNumbers')).toBeVisible();
 
   const sourceMetrics = await page.evaluate(() => {
@@ -377,7 +378,7 @@ test('uses one scroll container and renders the current viewport after mode swit
   expect(sourceMetrics.wrapperOverflow).toBeLessThanOrEqual(1);
   expect(sourceMetrics.scrollerOverflow).toBeGreaterThan(0);
 
-  await page.getByRole('button', { name: 'Write', exact: true }).click();
+  await page.getByRole('button', { name: '写作', exact: true }).click();
   await expect(page.locator('.cm-gutters .cm-lineNumbers')).toHaveCount(0);
   await expect(page.locator('.cm-task-widget')).toBeVisible();
   await expect(page.locator('.cm-table-widget')).toBeVisible();
@@ -409,7 +410,7 @@ test('keeps immersive and source content on the same reading grid', async ({ pag
   expect(immersiveLayout.contentPaddingTop).toBeGreaterThanOrEqual(32);
   expect(immersiveLayout.contentPaddingBottom).toBeGreaterThan(immersiveLayout.viewportHeight * 0.45);
 
-  await page.getByRole('button', { name: 'Source', exact: true }).click();
+  await page.getByRole('button', { name: '源码', exact: true }).click();
   const sourceLayout = await page.evaluate(() => {
     const pane = document.querySelector<HTMLElement>('.editor-pane')!.getBoundingClientRect();
     const lineElement = document.querySelector<HTMLElement>('.cm-line')!;

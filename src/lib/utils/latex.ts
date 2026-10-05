@@ -1,6 +1,6 @@
 import katex from 'katex';
 import {
-  scanFencedBlocks,
+  scanCodeRegions,
   scanMath,
   type MathRange,
   type SourceRange,
@@ -40,32 +40,52 @@ function replaceRanges(
   return result + content.slice(cursor);
 }
 
-function renderMathRange(item: MathRange, original: string): string {
+const formulaCache = new Map<string, string>();
+let formulaCacheSize = 0;
+
+export function renderFormula(source: string, display: boolean, original = source): string {
+  source = source.trim();
+  const key = JSON.stringify([source, display, original]);
+  const cached = formulaCache.get(key);
+  if (cached) return cached;
+  let result: string;
   try {
-    const html = katex.renderToString(item.source, {
-      displayMode: item.display,
-      throwOnError: false,
+    if (source.length > 50_000) throw new Error('公式超过 50000 字符，请拆分后渲染');
+    result = katex.renderToString(source, {
+      displayMode: display,
+      throwOnError: true,
       trust: false,
+      strict: 'warn',
+      maxExpand: 1000,
+      maxSize: 20,
     });
-    return item.display
-      ? `<div class="katex-display">${html}</div>`
-      : html;
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    const tag = item.display ? 'div' : 'span';
-    return `<${tag} class="katex-error" title="${escapeHtml(errorMsg)}">${escapeHtml(original)}</${tag}>`;
+    result = `<span class="katex-error reader-math-error" title="${escapeHtml(errorMsg)}"><span role="status">公式渲染失败</span><code>${escapeHtml(original)}</code></span>`;
   }
+  formulaCache.set(key, result);
+  formulaCacheSize += key.length + result.length;
+  while (formulaCache.size > 128 || formulaCacheSize > 2_000_000) {
+    const oldest = formulaCache.keys().next().value;
+    if (oldest === undefined) break;
+    formulaCacheSize -= oldest.length + formulaCache.get(oldest)!.length;
+    formulaCache.delete(oldest);
+  }
+  return result;
 }
 
 export function prepareLatex(content: string): { cleaned: string; map: Map<string, string> } {
   const map = new Map<string, string>();
-  const fences = scanFencedBlocks(content);
+  const fences = scanCodeRegions(content);
   const math = scanMath(content, fences);
 
+  let salt = '';
+  while (content.includes(`${BLOCK_PREFIX}${salt}`) || content.includes(`${INLINE_PREFIX}${salt}`)) salt += 'X';
   const replacements = math.map((item, index) => {
-    const id = makePlaceholder(item.display ? BLOCK_PREFIX : INLINE_PREFIX, index);
-    map.set(id, renderMathRange(item, content.slice(item.from, item.to)));
-    return { from: item.from, to: item.to, replacement: id };
+    const id = makePlaceholder((item.display ? BLOCK_PREFIX : INLINE_PREFIX) + salt, index);
+    map.set(id, renderFormula(item.source, item.display, content.slice(item.from, item.to)));
+    const newlines = content.slice(item.from, item.to).match(/\n/g)?.length ?? 0;
+    return { from: item.from, to: item.to, replacement: id + '\n'.repeat(newlines) };
   });
 
   return { cleaned: replaceRanges(content, replacements), map };
@@ -75,6 +95,11 @@ export function restoreLatex(html: string, map: Map<string, string>): string {
   let result = html;
 
   map.forEach((value, id) => {
+    // A standalone display formula must not inject a block into a paragraph.
+    if (value.includes('katex-display')) {
+      result = result.replace(new RegExp(`<p([^>]*)>\\s*${id}\\s*</p>`, 'g'),
+        (_match, attributes: string) => `<div class="reader-math-block"${attributes}>${value}</div>`);
+    }
     result = result.split(id).join(value);
     const escapedId = escapeHtml(id);
     if (escapedId !== id) {
@@ -82,7 +107,7 @@ export function restoreLatex(html: string, map: Map<string, string>): string {
     }
   });
 
-  return result.replace(/<p>\s*(<div class="katex-display">[\s\S]*?<\/div>)\s*<\/p>/g, '$1');
+  return result;
 }
 
 export function renderLatex(content: string): string {
@@ -93,11 +118,11 @@ export function renderLatex(content: string): string {
 
 export function hasLatex(content: string): boolean {
   if (!content) return false;
-  return scanMath(content, scanFencedBlocks(content)).length > 0;
+  return scanMath(content, scanCodeRegions(content)).length > 0;
 }
 
 export function extractLatex(content: string): Array<{ type: 'inline' | 'block'; formula: string; position: number }> {
-  return scanMath(content, scanFencedBlocks(content)).map(item => ({
+  return scanMath(content, scanCodeRegions(content)).map(item => ({
     type: item.display ? 'block' : 'inline',
     formula: item.source,
     position: item.from,

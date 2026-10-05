@@ -219,7 +219,7 @@
   }
 
   :global(.search-highlight) {
-    background: rgba(var(--accent-rgb), 0.2);
+    background: color-mix(in srgb, var(--ui-accent) 20%, transparent);
     color: var(--accent-color);
     padding: 0 2px;
     border-radius: 2px;

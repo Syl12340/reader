@@ -4,16 +4,21 @@
  */
 
 import { isTauri } from './platform';
+import { get } from 'svelte/store';
+import { settings } from '$lib/stores/settings';
 
 /**
  * 生成带时间戳的图片文件名
  */
-function generateImageName(): string {
+export function generateImageName(type = 'image/png'): string {
   const now = new Date();
   const pad = (n: number) => n.toString().padStart(2, '0');
   const date = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
   const time = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-  return `image-${date}-${time}.png`;
+  const extension = ({ 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif',
+    'image/svg+xml': 'svg', 'image/bmp': 'bmp', 'image/avif': 'avif' } as Record<string, string>)[type];
+  if (!extension) throw new Error(`不支持的图片格式：${type}`);
+  return `image-${date}-${time}-${crypto.randomUUID()}.${extension}`;
 }
 
 /**
@@ -45,6 +50,7 @@ async function blobToBase64(blob: Blob): Promise<string> {
       resolve(base64);
     };
     reader.onerror = reject;
+    reader.onabort = () => reject(new Error('图片读取已取消'));
     reader.readAsDataURL(blob);
   });
 }
@@ -62,7 +68,7 @@ export async function handleImagePaste(
   const blob = extractImageFromClipboard(event);
   if (!blob) return null;
 
-  const imageName = generateImageName();
+  const imageName = generateImageName(blob.type);
 
   if (isTauri()) {
     return await handleTauriImagePaste(blob, imageName, currentFilePath);
@@ -79,6 +85,8 @@ async function handleTauriImagePaste(
   imageName: string,
   currentFilePath: string | null
 ): Promise<string> {
+  const directory = get(settings).imageDirectory;
+  if (!currentFilePath) throw new Error(`请先保存文档，再将图片导入文档旁的 ${directory} 文件夹。`);
   const { invoke } = await import('@tauri-apps/api/core');
 
   // 获取当前文件所在目录
@@ -91,12 +99,8 @@ async function handleTauriImagePaste(
   }
 
   // 创建 assets 目录
-  const assetsDir = dirPath ? `${dirPath}/assets` : 'assets';
-  try {
-    await invoke('create_directory', { path: assetsDir });
-  } catch {
-    // 目录可能已存在，忽略错误
-  }
+  const assetsDir = dirPath ? `${dirPath}/${directory}` : directory;
+  await invoke('create_directory', { path: assetsDir });
 
   // 保存图片
   const base64 = await blobToBase64(blob);
@@ -104,18 +108,20 @@ async function handleTauriImagePaste(
   await invoke('save_image', { path: imagePath, data: base64 });
 
   // 返回相对路径的 Markdown 图片语法
-  return `![image](./assets/${imageName})`;
+  return `![image](./${directory.split('/').map(encodeURIComponent).join('/')}/${imageName})`;
 }
 
 /**
  * 浏览器模式：下载图片
  */
 async function handleBrowserImagePaste(blob: Blob, imageName: string): Promise<string> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
       resolve(`![image](${reader.result})`);
     };
+    reader.onerror = () => reject(reader.error ?? new Error('无法读取图片'));
+    reader.onabort = () => reject(new Error('图片读取已取消'));
     reader.readAsDataURL(blob);
   });
 }
@@ -136,30 +142,16 @@ export async function handleImageDrop(
   const file = files[0];
   if (!file.type.startsWith('image/')) return null;
 
-  const imageName = generateImageName();
+  const imageName = generateImageName(file.type);
 
   if (isTauri()) {
-    const base64 = await blobToBase64(file);
-    const { invoke } = await import('@tauri-apps/api/core');
-
-    let dirPath = '';
-    if (currentFilePath) {
-      const sep = currentFilePath.includes('\\') ? '\\' : '/';
-      const parts = currentFilePath.split(sep);
-      parts.pop();
-      dirPath = parts.join(sep);
-    }
-
-    const assetsDir = dirPath ? `${dirPath}/assets` : 'assets';
-    try {
-      await invoke('create_directory', { path: assetsDir });
-    } catch {}
-
-    const imagePath = `${assetsDir}/${imageName}`;
-    await invoke('save_image', { path: imagePath, data: base64 });
-
-    return `![image](./assets/${imageName})`;
+    return handleTauriImagePaste(file, imageName, currentFilePath);
   } else {
     return await handleBrowserImagePaste(file, imageName);
   }
+}
+
+export async function importImage(blob: Blob, filePath: string | null): Promise<string> {
+  const name = generateImageName(blob.type);
+  return isTauri() ? handleTauriImagePaste(blob, name, filePath) : handleBrowserImagePaste(blob, name);
 }

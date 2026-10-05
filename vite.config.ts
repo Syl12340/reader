@@ -1,5 +1,15 @@
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
+import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+
+const packageInfo = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+const git = (args: string[], fallback: string) => {
+  try { return execFileSync('git', args, { cwd: new URL('.', import.meta.url), encoding: 'utf8', windowsHide: true }).trim(); }
+  catch { return fallback; }
+};
+const buildInfo = { version: packageInfo.version, builtAt: process.env.READER_BUILD_TIME || new Date().toISOString(),
+  revision: git(['rev-parse', '--short=12', 'HEAD'], 'unknown'), dirty: !!git(['status', '--porcelain'], 'unknown') };
 
 export default defineConfig({
   plugins: [sveltekit()],
@@ -11,6 +21,7 @@ export default defineConfig({
   },
   envPrefix: ['VITE_', 'TAURI_'],
   define: {
+    __READER_BUILD_INFO__: JSON.stringify(buildInfo),
     'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || 'production'),
   },
   optimizeDeps: {

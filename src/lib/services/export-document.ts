@@ -1,6 +1,9 @@
 import katexCssSource from 'katex/dist/katex.min.css?raw';
 import { RenderService } from './render';
 import { sanitizeExportHtml } from '$lib/utils/export-formats';
+import { renderFormula } from '$lib/utils/latex';
+import { FIGURE_EXPORT_CSS } from '$lib/utils/export-html';
+import { checkExportSignal, waitForExport } from './export-job';
 
 const katexFontUrls = import.meta.glob('../../../node_modules/katex/dist/fonts/*.woff2', {
   eager: true,
@@ -28,16 +31,39 @@ async function blobToDataUrl(blob: Blob): Promise<string> {
   });
 }
 
-async function fetchAsDataUrl(url: string): Promise<string> {
+async function fetchAsDataUrl(url: string, signal?: AbortSignal): Promise<string> {
+  checkExportSignal(signal);
   if (url.startsWith('data:')) return url;
   const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
   const timeout = setTimeout(() => controller.abort(), 15_000);
   try {
     const response = await fetch(url, { signal: controller.signal });
     if (!response.ok) throw new Error(`Unable to load export resource: ${response.status}`);
-    return await blobToDataUrl(await response.blob());
+    const limit = 30_000_000;
+    if (Number(response.headers.get('content-length')) > limit) throw new Error('单个导出资源超过 30MB');
+    let blob: Blob;
+    if (response.body) {
+      const reader = response.body.getReader();
+      const chunks: ArrayBuffer[] = [];
+      let size = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          size += value.byteLength;
+          if (size > limit) { await reader.cancel(); throw new Error('单个导出资源超过 30MB'); }
+          chunks.push(new Uint8Array(value).buffer);
+        }
+      } finally { reader.releaseLock(); }
+      blob = new Blob(chunks, { type: response.headers.get('content-type') || 'application/octet-stream' });
+    } else blob = await response.blob();
+    if (blob.size > 30_000_000) throw new Error('单个导出资源超过 30MB');
+    return await blobToDataUrl(blob);
   } finally {
     clearTimeout(timeout);
+    signal?.removeEventListener('abort', abort);
   }
 }
 
@@ -87,32 +113,41 @@ async function renderMermaidElements(root: HTMLElement, theme: 'light' | 'dark')
   const { renderMermaid } = await import('$lib/utils/mermaid');
   for (const element of elements) {
     const encoded = element.dataset.mermaid;
-    if (!encoded) continue;
+    if (encoded === undefined) continue;
+    let source = encoded;
     try {
-      element.innerHTML = await renderMermaid(decodeURIComponent(encoded), theme);
+      source = decodeURIComponent(encoded);
+      element.innerHTML = await renderMermaid(source, theme);
       element.removeAttribute('data-mermaid');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      element.innerHTML = `<pre class="mermaid-error"><code>${escapeHtml(message)}</code></pre>`;
+      element.innerHTML = `<div class="mermaid-error"><p>${escapeHtml(message)}</p><pre><code>${escapeHtml(source)}</code></pre></div>`;
     }
+  }
+}
+
+async function renderChartElements(root: HTMLElement, theme: 'light' | 'dark'): Promise<void> {
+  const elements = [...root.querySelectorAll<HTMLElement>('[data-chart]')];
+  if (!elements.length) return;
+  const { renderDataChart, renderChartError } = await import('$lib/utils/data-chart');
+  for (const element of elements) {
+    let source = element.dataset.chart ?? '';
+    try { source = decodeURIComponent(source); element.innerHTML = renderDataChart(source, theme); }
+    catch (error) { element.innerHTML = renderChartError(source, error); }
+    element.removeAttribute('data-chart');
   }
 }
 
 async function renderLatexElements(root: HTMLElement): Promise<void> {
   const elements = Array.from(root.querySelectorAll<HTMLElement>('.latex-code-block'));
   if (elements.length === 0) return;
-  const katex = await import('katex');
   for (const element of elements) {
     const encoded = element.dataset.latex;
     if (!encoded) continue;
     let source = encoded;
     try {
       source = decodeURIComponent(encoded);
-      element.innerHTML = katex.default.renderToString(source, {
-        displayMode: true,
-        throwOnError: false,
-        trust: false,
-      });
+      element.innerHTML = renderFormula(source, true);
     } catch (error) {
       element.innerHTML = `<span class="katex-error">${escapeHtml(source)}</span>`;
     }
@@ -138,11 +173,13 @@ async function highlightCodeElements(root: HTMLElement, theme: 'light' | 'dark')
   }
 }
 
-async function inlineImages(root: HTMLElement, warnings: string[]): Promise<void> {
+export async function embedDocumentImages(root: Element, warnings: string[], signal?: AbortSignal): Promise<void> {
   const resources = new Map<string, Promise<string>>();
   root.querySelectorAll('picture source').forEach(source => source.remove());
-  await forEachResource(Array.from(root.querySelectorAll<HTMLImageElement>('img')), async image => {
-    const source = image.getAttribute('src');
+  await forEachResource(Array.from(root.querySelectorAll<HTMLElement>('img, svg image')), async image => {
+    checkExportSignal(signal);
+    const attribute = image.localName === 'img' ? 'src' : image.hasAttribute('href') ? 'href' : 'xlink:href';
+    const source = image.getAttribute(attribute);
     image.removeAttribute('srcset');
     image.removeAttribute('sizes');
     image.removeAttribute('loading');
@@ -150,14 +187,17 @@ async function inlineImages(root: HTMLElement, warnings: string[]): Promise<void
     try {
       let pending = resources.get(source);
       if (!pending) {
-        pending = fetchAsDataUrl(source);
+        pending = fetchAsDataUrl(source, signal);
         resources.set(source, pending);
       }
-      image.src = await pending;
+      image.setAttribute(attribute, await pending);
     } catch (error) {
+      checkExportSignal(signal);
       console.warn(`Failed to inline image ${source}:`, error);
-      warnings.push(`图片无法嵌入：${image.alt || source}`);
-      image.replaceWith(document.createTextNode(`[Image unavailable: ${image.alt ? image.alt + ' - ' : ''}${source}]`));
+      const alt = image.getAttribute('alt') || source;
+      warnings.push(`图片无法嵌入：${alt}`);
+      if (image.localName === 'img') image.replaceWith(document.createTextNode(`[Image unavailable: ${alt}]`));
+      else image.remove();
     }
   });
 }
@@ -172,25 +212,32 @@ export async function prepareExportDocument(
   markdown: string,
   filePath: string | null,
   theme: 'light' | 'dark',
+  options: { signal?: AbortSignal; onResources?: () => void } = {},
 ): Promise<PreparedExportDocument> {
+  checkExportSignal(options.signal);
   const container = document.createElement('div');
   const warnings: string[] = [];
   container.innerHTML = RenderService.render(markdown, { filePath });
 
   await renderLatexElements(container);
-  await renderMermaidElements(container, theme);
-  await highlightCodeElements(container, theme);
-  await inlineImages(container, warnings);
-  if (container.querySelector('.katex-error, .mermaid-error')) {
+  const [mathCss] = await waitForExport(Promise.all([
+    container.querySelector('.katex') ? inlineKatexCss() : Promise.resolve(''),
+    renderMermaidElements(container, theme), renderChartElements(container, theme), highlightCodeElements(container, theme),
+  ]), options.signal);
+  checkExportSignal(options.signal);
+  options.onResources?.();
+  await embedDocumentImages(container, warnings, options.signal);
+  checkExportSignal(options.signal);
+  if (container.querySelector('.katex-error, .mermaid-error, .reader-chart-error')) {
     warnings.push('部分公式或图表渲染失败，将保留错误提示或源码。');
   }
-  container.querySelectorAll('.copy-button').forEach(node => node.remove());
+  container.querySelectorAll('button, .reader-figure-actions, [data-export-hidden]').forEach(node => node.remove());
   container.querySelectorAll<HTMLElement>('[data-preview-key]')
     .forEach(node => node.removeAttribute('data-preview-key'));
 
   return {
     bodyHtml: sanitizeExportHtml(container.innerHTML),
-    embeddedCss: container.querySelector('.katex') ? await inlineKatexCss() : '',
-    warnings,
+    embeddedCss: mathCss + '\n' + FIGURE_EXPORT_CSS,
+    warnings: [...new Set(warnings)],
   };
 }

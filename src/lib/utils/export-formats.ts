@@ -1,6 +1,10 @@
 import { isTauri } from './platform';
 import { createStoredZip, type ZipEntry } from './zip';
 import { convertMarkdownVariant } from './markdown-variants';
+import { checkExportSignal } from '$lib/services/export-job';
+import { confirmAction } from '$lib/services/interaction';
+
+export interface ExportWriteOptions { path?: string; signal?: AbortSignal; onWrite?: () => void }
 
 type MarkdownVariant = 'gfm' | 'commonmark' | 'github';
 
@@ -100,23 +104,27 @@ function packageEpubResources(html: string, css: string) {
   return { html: root.body.innerHTML, css: rewrittenCss, properties, resources: [...resources.values()] };
 }
 
-async function saveExportFile(
+export async function saveExportFile(
   filename: string,
   content: string | Uint8Array | Blob,
   mimeType: string,
   description: string,
+  options: ExportWriteOptions = {},
 ): Promise<void> {
+  checkExportSignal(options.signal);
   const extension = filename.split('.').pop() || '';
   if (isTauri()) {
     const { saveExportDialog, writeBinaryFile } = await import('./tauri-fs');
-    const selectedPath = await saveExportDialog(filename, extension, description);
-    if (!selectedPath) return;
+    const selectedPath = options.path ?? await saveExportDialog(filename, extension, description);
+    if (!selectedPath) throw new DOMException('Export canceled', 'AbortError');
 
     const bytes = typeof content === 'string'
       ? new TextEncoder().encode(content)
       : content instanceof Blob
         ? new Uint8Array(await content.arrayBuffer())
         : content;
+    checkExportSignal(options.signal);
+    options.onWrite?.();
     await writeBinaryFile(ensureExtension(selectedPath, extension), bytesToBase64(bytes));
     return;
   }
@@ -126,13 +134,16 @@ async function saveExportFile(
     : new Uint8Array(content).buffer;
   const blob = blobPart instanceof Blob ? blobPart : new Blob([blobPart], { type: mimeType });
   const url = URL.createObjectURL(blob);
+  checkExportSignal(options.signal);
+  options.onWrite?.();
   const anchor = document.createElement('a');
   anchor.href = url;
   anchor.download = filename;
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-  URL.revokeObjectURL(url);
+  // The browser may not have consumed the download URL when click() returns.
+  setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }
 
 export function sanitizeExportHtml(html: string): string {
@@ -145,7 +156,7 @@ export function sanitizeExportHtml(html: string): string {
   }
 
   const documentNode = new DOMParser().parseFromString(`<body>${html}</body>`, 'text/html');
-  documentNode.querySelectorAll('script, iframe, object, embed, .copy-button').forEach(node => node.remove());
+  documentNode.querySelectorAll('script, iframe, object, embed, button, .reader-figure-actions, [data-export-hidden]').forEach(node => node.remove());
   documentNode.querySelectorAll<HTMLElement>('*').forEach(element => {
     for (const attribute of Array.from(element.attributes)) {
       if (/^on/i.test(attribute.name)) element.removeAttribute(attribute.name);
@@ -422,9 +433,9 @@ ${context.relationships.join('')}
   return createStoredZip(entries, date);
 }
 
-export async function exportAsDocx(title: string, htmlContent: string): Promise<void> {
+export async function exportAsDocx(title: string, htmlContent: string, options: ExportWriteOptions = {}): Promise<void> {
   const parsed = new DOMParser().parseFromString(sanitizeExportHtml(htmlContent), 'text/html');
-  if (parsed.querySelector('.katex') && !confirm('DOCX 中的公式将保留为可编辑的 LaTeX 源码，不是 Word 原生公式。是否继续？')) return;
+  if (parsed.querySelector('.katex') && !await confirmAction('DOCX 公式兼容性', 'DOCX 中的公式将保留为可编辑的 LaTeX 源码，不是 Word 原生公式。是否继续？', '继续导出')) throw new DOMException('Export canceled', 'AbortError');
   for (const svg of Array.from(parsed.querySelectorAll('svg'))) {
     if (svg.closest('.katex')) continue;
     const image = parsed.createElement('img');
@@ -460,6 +471,7 @@ export async function exportAsDocx(title: string, htmlContent: string): Promise<
     buildDocx(title, parsed.body.innerHTML),
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     'Word Document',
+    options,
   );
 }
 
@@ -535,12 +547,13 @@ export function buildEpub(
   return createStoredZip(entries, date);
 }
 
-export async function exportAsEpub(title: string, htmlContent: string, author?: string, embeddedCss = ''): Promise<void> {
+export async function exportAsEpub(title: string, htmlContent: string, author?: string, embeddedCss = '', options: ExportWriteOptions = {}): Promise<void> {
   await saveExportFile(
     `${baseName(title)}.epub`,
     buildEpub(title, htmlContent, author, new Date(), embeddedCss),
     'application/epub+zip',
     'EPUB Book',
+    options,
   );
 }
 
@@ -676,12 +689,13 @@ export function convertMarkdownToLatex(title: string, markdown: string): string 
   return output.join('\n');
 }
 
-export async function exportAsLatex(title: string, markdownContent: string): Promise<void> {
+export async function exportAsLatex(title: string, markdownContent: string, options: ExportWriteOptions = {}): Promise<void> {
   await saveExportFile(
     `${baseName(title)}.tex`,
     convertMarkdownToLatex(title, markdownContent),
     'application/x-tex',
     'LaTeX Document',
+    options,
   );
 }
 
@@ -702,6 +716,7 @@ export async function exportAsMarkdownVariant(
   title: string,
   content: string,
   variant: MarkdownVariant,
+  options: ExportWriteOptions = {},
 ): Promise<void> {
   const converted = variant === 'gfm'
     ? convertToGFM(content)
@@ -709,16 +724,13 @@ export async function exportAsMarkdownVariant(
       ? convertToCommonMark(content)
       : convertToGitHub(content);
   const suffix = variant === 'gfm' ? '.gfm.md' : variant === 'commonmark' ? '.cm.md' : '.github.md';
-  await saveExportFile(`${baseName(title)}${suffix}`, converted, 'text/markdown', 'Markdown Document');
+  await saveExportFile(`${baseName(title)}${suffix}`, converted, 'text/markdown', 'Markdown Document', options);
 }
 
 function waitForImages(container: HTMLElement): Promise<void> {
   return Promise.all(Array.from(container.querySelectorAll('img')).map(image => {
-    if (image.complete) return Promise.resolve();
-    return new Promise<void>(resolve => {
-      image.addEventListener('load', () => resolve(), { once: true });
-      image.addEventListener('error', () => resolve(), { once: true });
-    });
+    image.loading = 'eager';
+    return image.decode();
   })).then(() => undefined);
 }
 
@@ -879,6 +891,7 @@ export async function exportAsImage(
   htmlContent: string,
   format: 'png' | 'jpg' = 'png',
   embeddedCss = '',
+  options: ExportWriteOptions = {},
 ): Promise<void> {
   const blob = await renderHtmlToImage(htmlContent, format, embeddedCss);
   await saveExportFile(
@@ -886,6 +899,7 @@ export async function exportAsImage(
     blob,
     format === 'png' ? 'image/png' : 'image/jpeg',
     format === 'png' ? 'PNG Image' : 'JPEG Image',
+    options,
   );
 }
 

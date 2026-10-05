@@ -1,7 +1,10 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import type { FileNode } from '$lib/stores/file';
   import Self from './FileTree.svelte';
   import { isTauri } from '$lib/utils/platform';
+  import { normalizePathKey } from '$lib/utils/path';
+  import { popupNavigation } from '$lib/utils/menu-navigation';
 
   let { nodes, onFileClick, onToggle, onLoadChildren, onRename, onDelete, activePath = null, level = 0 }: {
     nodes: FileNode[];
@@ -34,7 +37,7 @@
   function handleContextMenu(event: MouseEvent, node: FileNode) {
     event.preventDefault();
     event.stopPropagation();
-    contextMenu = { x: event.clientX, y: event.clientY, node };
+    contextMenu = { x: Math.max(8, Math.min(event.clientX, window.innerWidth - 190)), y: Math.max(8, Math.min(event.clientY, window.innerHeight - 180)), node };
   }
 
   function closeContextMenu() {
@@ -64,11 +67,24 @@
   }
 
   function handleRenameKeydown(event: KeyboardEvent) {
+    if (event.isComposing) return;
     if (event.key === 'Enter') {
+      event.preventDefault(); event.stopPropagation();
       confirmRename();
     } else if (event.key === 'Escape') {
+      event.preventDefault(); event.stopPropagation();
+      const row = (event.target as HTMLElement).closest('.file-tree-row');
       cancelRename();
+      void tick().then(() => row?.querySelector<HTMLButtonElement>('button')?.focus());
     }
+  }
+  function focusRename(input: HTMLInputElement) {
+    queueMicrotask(() => {
+      if (!input.isConnected) return;
+      input.focus();
+      const dot = input.value.lastIndexOf('.');
+      input.setSelectionRange(0, dot > 0 ? dot : input.value.length);
+    });
   }
 
   function handleDelete(node: FileNode, permanent = false) {
@@ -76,52 +92,45 @@
     onDelete?.(node.path, permanent, node.isDirectory);
   }
 
-  function getFileIcon(node: FileNode): string {
-    if (node.isDirectory) {
-      return node.isExpanded ? 'v' : '>';
-    }
-    return '';
-  }
-
   function isActiveNode(node: FileNode): boolean {
     if (node.isDirectory || !activePath) return false;
-    return node.path === activePath || activePath.endsWith(node.path);
+    return normalizePathKey(node.path) === normalizePathKey(activePath);
   }
 </script>
 
-<svelte:window onclick={closeContextMenu} />
+<svelte:window onclick={closeContextMenu} onkeydown={event => { if (event.key === 'Escape') closeContextMenu(); }} />
 
-<div class="file-tree" style="padding-left: {level * 16}px">
+<div class="file-tree" style="padding-left: {level ? 16 : 0}px">
   {#each nodes as node (node.path)}
-    <div>
+    <div class="file-tree-row">
+      {#if renamingNode?.path === node.path}
+        <div class="file-tree-rename">
+          <input class="rename-input" aria-label={`重命名 ${node.name}`} use:focusRename bind:value={renameInput}
+            onblur={confirmRename} onkeydown={handleRenameKeydown} />
+        </div>
+      {:else}
       <button
         class="file-tree-item w-full"
         class:active={isActiveNode(node)}
+        title={node.path}
+        aria-expanded={node.isDirectory ? !!node.isExpanded : undefined}
+        aria-current={isActiveNode(node) ? 'page' : undefined}
         onclick={() => handleClick(node)}
         oncontextmenu={(e) => handleContextMenu(e, node)}
+        onkeydown={event => { if (event.key === 'F2' && onRename) { event.preventDefault(); startRename(node); } }}
       >
-        <span class="file-tree-icon">
-          {getFileIcon(node)}
+        <span class="file-tree-icon" aria-hidden="true">
+          {#if node.isDirectory}
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" style="transform: rotate({node.isExpanded ? 90 : 0}deg)"><path d="m6 3 5 5-5 5" /></svg>
+          {:else}
+            <svg width="13" height="15" viewBox="0 0 16 18" fill="none" stroke="currentColor"><path d="M3 1h6l4 4v12H3z M9 1v4h4" /></svg>
+          {/if}
         </span>
-        {#if renamingNode?.path === node.path}
-          <input
-            class="rename-input"
-            bind:value={renameInput}
-            onblur={confirmRename}
-            onkeydown={handleRenameKeydown}
-            onclick={(e) => e.stopPropagation()}
-          />
-        {:else}
           <span class="file-tree-name">
             {node.name}
           </span>
-        {/if}
-        {#if node.isDirectory}
-          <span class="file-tree-chevron" aria-hidden="true">
-            {node.isExpanded ? 'v' : '>'}
-          </span>
-        {/if}
       </button>
+      {/if}
 
       {#if node.isDirectory && node.isExpanded && node.children}
         <Self
@@ -143,6 +152,7 @@
 {#if contextMenu}
   <div
     class="context-menu"
+    use:popupNavigation={closeContextMenu}
     style="left: {contextMenu.x}px; top: {contextMenu.y}px"
     role="menu"
     tabindex="-1"
@@ -162,6 +172,7 @@
 {/if}
 
 <style>
+  .file-tree-rename { display: flex; align-items: center; min-height: 27px; padding: 2px 6px 2px 23px; }
   .rename-input {
     flex: 1;
     padding: 1px 4px;
@@ -172,6 +183,8 @@
     font-size: 13px;
     font-family: inherit;
     outline: none;
+    min-width: 0;
+    width: 100%;
   }
 
   .file-tree {
@@ -214,22 +227,16 @@
     white-space: nowrap;
   }
 
-  .file-tree-chevron {
-    margin-left: 6px;
-    color: var(--ui-text-muted);
-    font-size: 10px;
-    opacity: 0.55;
-  }
-
   .context-menu {
     position: fixed;
     z-index: 200;
     min-width: 120px;
-    background: var(--bg-primary);
-    border: 1px solid var(--border-color);
+    background: var(--ui-panel-active);
+    border: 1px solid var(--ui-border);
     border-radius: 6px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    box-shadow: var(--ui-shadow-popover);
     padding: 4px 0;
+    max-width: calc(100vw - 16px);
   }
 
   .context-menu-item {

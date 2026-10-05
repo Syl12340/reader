@@ -1,6 +1,6 @@
 /* 文档排版设计令牌 */
 :root {
-  --doc-bg: #fbfbfb;
+  --doc-bg: #ffffff;
   --doc-paper-bg: #ffffff;
   --doc-text: #2b2b2b;
   --doc-text-muted: #787878;
@@ -12,7 +12,7 @@
   --doc-table-border: #e2e2e2;
   --doc-subtle-rule: #eeeeee;
   
-  --doc-content-width: 760px;
+  --doc-content-width: 800px;
   --doc-font-size: 16px;
   --doc-line-height: 1.78;
 }

@@ -587,7 +587,23 @@ pub struct ContentSearchResult {
 }
 
 #[command]
-pub fn search_content(
+pub async fn search_content(
+    directory: String,
+    query: String,
+    max_results: Option<usize>,
+    extensions: Option<Vec<String>>,
+    exclude_dirs: Option<Vec<String>>,
+    case_sensitive: Option<bool>,
+    use_regex: Option<bool>,
+    whole_word: Option<bool>,
+) -> Result<Vec<ContentSearchResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        search_content_blocking(directory, query, max_results, extensions, exclude_dirs,
+            case_sensitive, use_regex, whole_word)
+    }).await.map_err(|error| format!("Search task failed: {}", error))?
+}
+
+fn search_content_blocking(
     directory: String, 
     query: String, 
     max_results: Option<usize>,

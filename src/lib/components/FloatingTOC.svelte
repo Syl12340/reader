@@ -1,5 +1,6 @@
 <script lang="ts">
   import { fileContent } from '$lib/stores/document';
+  import { extractHeadings } from '$lib/utils/headings';
 
   let isOpen = $state(false);
 
@@ -10,33 +11,6 @@
   }
 
   let headings = $derived(extractHeadings($fileContent));
-
-  function extractHeadings(content: string): Heading[] {
-    if (!content) return [];
-    const result: Heading[] = [];
-    const lines = content.split('\n');
-    let inCodeBlock = false;
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (line.trim().startsWith('```')) {
-        inCodeBlock = !inCodeBlock;
-        continue;
-      }
-      if (inCodeBlock) continue;
-
-      const match = line.match(/^(#{1,6})\s+(.+)$/);
-      if (match) {
-        result.push({
-          level: match[1].length,
-          text: match[2].trim(),
-          line: i + 1,
-        });
-      }
-    }
-
-    return result;
-  }
 
   function handleClick(line: number) {
     const event = new CustomEvent('heading-click', { detail: { line } });

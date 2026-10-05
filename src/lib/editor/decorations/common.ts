@@ -6,10 +6,11 @@ export interface DecorationRange extends SourceRange {
 }
 
 export function revealSource(view: EditorView, position: number): void {
+  if (!view.dom.isConnected) return;
   const target = Math.min(position, view.state.doc.length);
   view.dispatch({
     selection: { anchor: target },
-    effects: EditorView.scrollIntoView(target, { y: 'center' }),
+    effects: EditorView.scrollIntoView(target, { y: 'nearest' }),
   });
   view.focus();
 }

@@ -2,6 +2,8 @@ mod commands;
 mod file_io;
 mod pdf;
 mod search;
+mod navigation;
+mod diagnostics;
 
 use commands::*;
 use tauri::Manager;
@@ -36,6 +38,9 @@ pub fn run() {
             search_content,
             search::preview_replacement,
             pdf::export_pdf_native,
+            navigation::open_external_url,
+            navigation::open_document_path,
+            diagnostics::runtime_diagnostics,
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {

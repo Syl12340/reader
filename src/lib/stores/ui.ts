@@ -1,6 +1,7 @@
 import { derived, get, writable } from 'svelte/store';
 import type { EditorMode, TableEditRequest, WorkspaceLayout } from '$lib/types';
 import { activeSession, activeSessionId, sessions } from './document';
+import { settings, updateSettings } from './settings';
 
 const defaultLayout = writable<WorkspaceLayout>('wysiwym');
 const layoutValue = derived([activeSession, defaultLayout], ([session, fallback]) => session?.workspaceLayout ?? fallback);
@@ -51,10 +52,18 @@ export function toggleSplitPreview() {
 }
 
 // ── 打字机模式 ──
-export const typewriterMode = writable(false);
+export const typewriterMode = {
+  subscribe: derived(settings, value => value.typewriterMode).subscribe,
+  set: (value: boolean) => updateSettings({ typewriterMode: value }),
+  update: (updater: (value: boolean) => boolean) => updateSettings({ typewriterMode: updater(get(settings).typewriterMode) }),
+};
 
 // ── 专注模式 ──
-export const focusMode = writable(false);
+export const focusMode = {
+  subscribe: derived(settings, value => value.focusMode).subscribe,
+  set: (value: boolean) => updateSettings({ focusMode: value }),
+  update: (updater: (value: boolean) => boolean) => updateSettings({ focusMode: updater(get(settings).focusMode) }),
+};
 
 // ── 全局搜索面板开关 ──
 export const globalSearchOpen = writable(false);

@@ -1,6 +1,7 @@
 import { writable, derived, get } from 'svelte/store';
 import type { DocumentSession } from '$lib/types';
 import { normalizePathKey, pathContains, replacePathPrefix } from '$lib/utils/path';
+import { documentStats } from '$lib/utils/document-stats';
 
 export const sessions = writable<DocumentSession[]>([]);
 export const activeSessionId = writable<string | null>(null);
@@ -20,13 +21,25 @@ export const fileExtension = derived(fileName, name => {
   const parts = name.split('.');
   return parts.length > 1 ? parts.pop()?.toLowerCase() || null : null;
 });
-export const wordCount = derived(fileContent, content =>
-  content ? content.trim().split(/\s+/).filter(Boolean).length : 0,
-);
-export const lineCount = derived(fileContent, content => content ? content.split('\n').length : 0);
-export const charCount = derived(fileContent, content => content.length);
+export const documentStatistics = derived(fileContent, (content, set) => {
+  const timer = setTimeout(() => set(documentStats(content)), 180);
+  return () => clearTimeout(timer);
+}, documentStats(''));
+export const wordCount = derived(documentStatistics, stats => stats.words);
+export const lineCount = derived(documentStatistics, stats => stats.lines);
+export const charCount = derived(documentStatistics, stats => stats.chars);
 
 let nextSessionId = 1;
+const closedSessions: DocumentSession[] = [];
+
+export function cycleSession(direction: number): void {
+  const list = get(sessions);
+  if (!list.length) return;
+  const index = list.findIndex(session => session.id === get(activeSessionId));
+  activeSessionId.set(list[(Math.max(index, 0) + direction + list.length) % list.length].id);
+}
+
+export function takeClosedSession(): DocumentSession | undefined { return closedSessions.pop(); }
 
 export function createSession(
   name: string,
@@ -101,6 +114,11 @@ export function closeSession(id: string) {
   sessions.update(list => {
     const index = list.findIndex(s => s.id === id);
     if (index === -1) return list;
+    // Retain clean tabs only; explicitly discarded drafts must not reappear.
+    if (!list[index].isDirty && (list[index].path || list[index].fileHandle)) {
+      closedSessions.push({ ...list[index], editorState: undefined });
+      if (closedSessions.length > 20) closedSessions.shift();
+    }
 
     const newList = list.filter(s => s.id !== id);
 
@@ -187,22 +205,22 @@ export function updateSessionCursor(id: string, cursorOffset: number) {
   });
 }
 
-export function updateSessionScroll(id: string, scrollTop: number) {
+export function updateSessionScroll(id: string, scrollTop: number, editorAnchor?: DocumentSession['editorAnchor']) {
   sessions.update(list => {
     const index = list.findIndex(session => session.id === id);
-    if (index < 0 || Math.abs(list[index].scrollTop - scrollTop) < 0.5) return list;
+    if (index < 0 || (!editorAnchor && Math.abs(list[index].scrollTop - scrollTop) < 0.5)) return list;
     const next = [...list];
-    next[index] = { ...list[index], scrollTop };
+    next[index] = { ...list[index], scrollTop, editorAnchor: editorAnchor ?? list[index].editorAnchor };
     return next;
   });
 }
 
-export function updateSessionPreviewScroll(id: string, previewScrollTop: number) {
+export function updateSessionPreviewScroll(id: string, previewScrollTop: number, previewAnchor?: DocumentSession['previewAnchor']) {
   sessions.update(list => {
     const index = list.findIndex(session => session.id === id);
-    if (index < 0 || Math.abs((list[index].previewScrollTop ?? 0) - previewScrollTop) < 0.5) return list;
+    if (index < 0 || (!previewAnchor && Math.abs((list[index].previewScrollTop ?? 0) - previewScrollTop) < 0.5)) return list;
     const next = [...list];
-    next[index] = { ...list[index], previewScrollTop };
+    next[index] = { ...list[index], previewScrollTop, previewAnchor: previewAnchor ?? list[index].previewAnchor };
     return next;
   });
 }

@@ -1,4 +1,4 @@
-import katex from 'katex';
+import { renderFormula } from '../../utils/latex';
 import { WidgetType, type EditorView } from '@codemirror/view';
 import type { MathRange } from '../markdown-scanner';
 import { makeSourceButton, revealSource } from './common';
@@ -25,13 +25,8 @@ export class MathWidget extends WidgetType {
     container.className = this.block
       ? 'cm-math-widget cm-block-widget'
       : 'cm-math-widget cm-inline-widget';
-    try {
-      container.innerHTML = katex.renderToString(this.item.source, {
-        displayMode: this.item.display,
-        throwOnError: true,
-        trust: false,
-        strict: 'warn',
-      });
+    container.innerHTML = renderFormula(this.item.source, this.item.display);
+    if (!container.querySelector('.katex-error')) {
       container.tabIndex = 0;
       container.setAttribute('role', 'button');
       container.setAttribute('aria-label', '编辑公式');
@@ -43,9 +38,8 @@ export class MathWidget extends WidgetType {
           revealSource(view, this.item.from);
         }
       });
-    } catch (error) {
+    } else {
       container.className += ' cm-widget-error';
-      container.textContent = error instanceof Error ? error.message : '公式渲染失败';
       container.appendChild(makeSourceButton('编辑公式', view, this.item.from));
     }
     return container;

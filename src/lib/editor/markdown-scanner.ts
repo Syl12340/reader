@@ -1,3 +1,7 @@
+import MarkdownIt from 'markdown-it';
+
+const blockParser = new MarkdownIt({ html: false });
+
 export interface SourceRange {
   from: number;
   to: number;
@@ -15,6 +19,7 @@ export interface TaskRange extends SourceRange {
 export interface FenceRange extends SourceRange {
   language: string;
   code: string;
+  closed?: boolean;
 }
 
 export interface TableRange extends SourceRange {
@@ -34,29 +39,57 @@ function overlaps(range: SourceRange, excluded: SourceRange[]): boolean {
   return excluded.some(item => range.from < item.to && range.to > item.from);
 }
 
+export function scanCodeRegions(text: string): SourceRange[] {
+  const offsets = [0];
+  for (let index = 0; index < text.length; index++) if (text[index] === '\n') offsets.push(index + 1);
+  const ranges: SourceRange[] = [];
+  for (const token of blockParser.parse(text, {})) {
+    if ((token.type === 'fence' || token.type === 'code_block') && token.map) {
+      ranges.push({ from: offsets[token.map[0]] ?? text.length, to: offsets[token.map[1]] ?? text.length });
+    }
+  }
+  return ranges;
+}
+
 export function scanFencedBlocks(text: string): FenceRange[] {
   const results: FenceRange[] = [];
-  const pattern = /^([ \t]*)(`{3,}|~{3,})([^\n]*)\r?\n([\s\S]*?)^\1\2[ \t]*$/gm;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(text))) {
-    const start = match.index;
-    results.push({
-      from: start,
-      to: start + match[0].length,
-      language: match[3].trim().split(/\s+/)[0]?.toLowerCase() || 'text',
-      code: match[4].replace(/\r?\n$/, ''),
-    });
+  let open: { from: number; body: number; marker: string; language: string } | null = null;
+  const lines = /^[^\n]*(?:\n|$)/gm;
+  for (const match of text.matchAll(lines)) {
+    if (!match[0]) continue;
+    const line = match[0].replace(/\r?\n$/, '');
+    const fence = /^[ \t]*(`{3,}|~{3,})(.*)$/.exec(line);
+    if (!fence) continue;
+    if (!open) {
+      if (fence[1][0] === '`' && fence[2].includes('`')) continue;
+      open = { from: match.index!, body: match.index! + match[0].length, marker: fence[1],
+        language: fence[2].trim().split(/\s+/)[0]?.toLowerCase() || 'text' };
+    } else if (fence[1][0] === open.marker[0] && fence[1].length >= open.marker.length && !fence[2].trim()) {
+      results.push({ from: open.from, to: match.index! + line.length, language: open.language,
+        code: text.slice(open.body, match.index).replace(/\r?\n$/, ''), closed: true });
+      open = null;
+    }
   }
+  if (open) results.push({ from: open.from, to: text.length, language: open.language,
+    code: text.slice(open.body), closed: false });
   return results;
 }
 
 export function scanInlineCode(text: string, excluded: SourceRange[] = []): SourceRange[] {
   const results: SourceRange[] = [];
-  const pattern = /(`+)([^`\n]*?)\1/g;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(text))) {
-    const range = { from: match.index, to: match.index + match[0].length };
-    if (!overlaps(range, excluded)) results.push(range);
+  const markers = [...text.matchAll(/`+/g)];
+  for (let index = 0; index < markers.length; index++) {
+    const start = markers[index];
+    if (isEscaped(text, start.index!) || overlaps({ from: start.index!, to: start.index! + start[0].length }, excluded)) continue;
+    for (let end = index + 1; end < markers.length; end++) {
+      const close = markers[end];
+      if (close[0].length !== start[0].length) continue;
+      const range = { from: start.index!, to: close.index! + close[0].length };
+      if (overlaps(range, excluded) || /\n\s*\n/.test(text.slice(range.from, range.to))) break;
+      results.push(range);
+      index = end;
+      break;
+    }
   }
   return results;
 }
@@ -73,13 +106,13 @@ export function scanMath(text: string, excluded: SourceRange[] = []): MathRange[
     }
   };
 
-  const blockPattern = /\$\$([\s\S]*?)\$\$/g;
+  const blockPattern = /\$\$((?:\\[\s\S]|(?!\$\$)[^\\])*?)\$\$/g;
   while ((match = blockPattern.exec(text))) {
     const range = { from: match.index, to: match.index + match[0].length };
     addRange(range, match[1].trim(), true);
   }
 
-  const bracketBlockPattern = /\\\[([\s\S]*?)\\\]/g;
+  const bracketBlockPattern = /\\\[((?:\\\\|\\(?!\])[^\n]?|[^\\])*?)\\\]/g;
   while ((match = bracketBlockPattern.exec(text))) {
     const range = { from: match.index, to: match.index + match[0].length };
     addRange(range, match[1].trim(), true);
@@ -91,13 +124,13 @@ export function scanMath(text: string, excluded: SourceRange[] = []): MathRange[
     addRange(range, match[0].trim(), true);
   }
 
-  const inlinePattern = /(?<!\$)\$(?!\s)([^\$\n]+?)(?<!\s)\$(?!\$)/g;
+  const inlinePattern = /(?<!\$)\$(?![\s$])((?:\\[^\n]|[^$\\\n])+?)(?<!\s)\$(?!\$)/g;
   while ((match = inlinePattern.exec(text))) {
     const range = { from: match.index, to: match.index + match[0].length };
-    addRange(range, match[1], false);
+    if (!isEscaped(text, range.to - 1)) addRange(range, match[1], false);
   }
 
-  const parenInlinePattern = /\\\(([^\n]*?)\\\)/g;
+  const parenInlinePattern = /\\\(((?:\\\\|\\(?!\))[^\n]?|[^\\\n])*?)\\\)/g;
   while ((match = parenInlinePattern.exec(text))) {
     const range = { from: match.index, to: match.index + match[0].length };
     addRange(range, match[1], false);

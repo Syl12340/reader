@@ -1,6 +1,21 @@
 export function normalizePathKey(path: string): string {
-  const normalized = path.replace(/\\/g, '/').replace(/\/+$/, '');
-  return /^[a-zA-Z]:\//.test(normalized) ? normalized.toLowerCase() : normalized;
+  const normalized = resolvePath(path).replace(/\/+$/, '');
+  return /^[a-zA-Z]:\//.test(normalized) || normalized.startsWith('//') ? normalized.toLowerCase() : normalized;
+}
+
+export function resolvePath(path: string): string {
+  const normalized = path.replace(/\\/g, '/');
+  const prefix = normalized.startsWith('//') ? '//' : normalized.startsWith('/') ? '/' : '';
+  const parts: string[] = [];
+  const rootDepth = prefix === '//' ? 2 : /^[a-zA-Z]:/.test(normalized) ? 1 : 0;
+  for (const part of normalized.split('/').filter(Boolean)) {
+    if (part === '.') continue;
+    if (part === '..') {
+      if (parts.length > rootDepth && parts.at(-1) !== '..') parts.pop();
+      else if (!prefix && rootDepth === 0) parts.push(part);
+    } else parts.push(part);
+  }
+  return prefix + parts.join('/');
 }
 
 export function pathContains(parent: string, candidate: string): boolean {

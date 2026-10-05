@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { tick } from 'svelte';
+  import { anchoredPopover } from '$lib/utils/popover-position';
   export interface SlashItem {
     id: string;
     label: string;
@@ -29,6 +31,7 @@
     { id: 'code', label: '代码块', description: '插入 fenced code', icon: '</>' },
     { id: 'latex', label: '数学公式', description: '插入 LaTeX 公式块', icon: 'Σ' },
     { id: 'mermaid', label: 'Mermaid 图表', description: '插入流程图', icon: '◇' },
+    { id: 'chart', label: '数据图表', description: '插入折线、柱状或散点图 JSON', icon: 'xy' },
     { id: 'table', label: '表格', description: '选择行列并插入表格', icon: '▦' },
     { id: 'quote', label: '引用', description: '引用文本', icon: '❝' },
     { id: 'hr', label: '分割线', description: '水平分割线', icon: '—' },
@@ -39,6 +42,7 @@
   ];
 
   let selectedIndex = $state(0);
+  let menu: HTMLDivElement | undefined = $state();
   let filteredItems = $derived(items.filter(item => {
     const normalized = query.trim().toLowerCase();
     return !normalized
@@ -48,16 +52,20 @@
   }));
 
   $effect(() => {
-    query;
+    void query; void visible;
     selectedIndex = 0;
   });
+  function revealSelected() {
+    void tick().then(() => menu?.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest' }));
+  }
 
   function select(item: SlashItem): void {
     onSelect?.(item);
   }
 
   function handleKeydown(event: KeyboardEvent): void {
-    if (!visible) return;
+    if (!visible || event.isComposing || event.defaultPrevented || !(event.target instanceof Element)
+      || !event.target.closest('.cm-content, .slash-menu') || event.target.closest('[role="dialog"], [role="alertdialog"]')) return;
     if (event.key === 'Escape') {
       event.stopPropagation();
       event.preventDefault();
@@ -66,10 +74,12 @@
       event.stopPropagation();
       event.preventDefault();
       selectedIndex = (selectedIndex + 1) % filteredItems.length;
+      revealSelected();
     } else if (event.key === 'ArrowUp' && filteredItems.length) {
       event.stopPropagation();
       event.preventDefault();
       selectedIndex = (selectedIndex - 1 + filteredItems.length) % filteredItems.length;
+      revealSelected();
     } else if (event.key === 'Enter' && filteredItems[selectedIndex]) {
       event.stopPropagation();
       event.preventDefault();
@@ -80,10 +90,11 @@
 
 <svelte:window onkeydowncapture={handleKeydown} />
 
-{#if visible && filteredItems.length > 0}
+{#if visible}
   <div
+    bind:this={menu}
     class="slash-menu"
-    style="left: {x}px; top: {y}px;"
+    use:anchoredPopover={{ x, y }}
     role="listbox"
     aria-label="插入内容"
   >
@@ -94,16 +105,18 @@
         class:selected={index === selectedIndex}
         role="option"
         aria-selected={index === selectedIndex}
-        onmousedown={(event) => {
-          event.preventDefault();
-          select(item);
-        }}
+        tabindex="-1"
+        onmousedown={event => event.preventDefault()}
+        onmouseenter={() => selectedIndex = index}
+        onclick={() => select(item)}
       >
         <span class="slash-menu-icon">{item.icon}</span>
         <span class="slash-menu-label">{item.label}</span>
         <span class="slash-menu-desc">{item.description}</span>
       </button>
     {/each}
+    {#if !filteredItems.length}<p role="status">没有匹配的内容，按 Esc 继续输入。</p>{/if}
+    <footer>↑ ↓ 选择 · Enter 插入 · Esc 关闭</footer>
   </div>
 {/if}
 
@@ -115,7 +128,7 @@
     max-height: 340px;
     overflow-y: auto;
     padding: 6px;
-    background: var(--ui-panel);
+    background: var(--ui-panel-active);
     border: 1px solid var(--ui-border);
     border-radius: 6px;
     box-shadow: var(--ui-shadow-popover);
@@ -149,4 +162,6 @@
   }
   .slash-menu-label { font-size: 13px; font-weight: 500; }
   .slash-menu-desc { font-size: 11px; color: var(--ui-text-muted); }
+  footer, p { padding: 8px 10px; font-size: 12px; color: var(--ui-text-muted); }
+  footer { border-top: 1px solid var(--ui-border); margin-top: 4px; }
 </style>

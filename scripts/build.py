@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -64,6 +65,7 @@ def main():
         print('Warning: pnpm 未在 PATH 中找到。脚本将尝试通过 shell 回退执行 pnpm 命令。')
 
     env = os.environ.copy()
+    env['READER_BUILD_TIME'] = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
     if args.cargo_target_dir:
         env['CARGO_TARGET_DIR'] = str(Path(args.cargo_target_dir).resolve())
         print(f"Set CARGO_TARGET_DIR={env['CARGO_TARGET_DIR']}")

@@ -3,6 +3,7 @@ import type { EditorState } from '@codemirror/state';
 import { WidgetType, type EditorView } from '@codemirror/view';
 import type { SourceRange } from '../markdown-scanner';
 import { makeSourceButton, revealSource } from './common';
+import { inspectResource } from '../resource-request';
 
 export interface ImageRange extends SourceRange {
   source: string;
@@ -41,6 +42,11 @@ export class ImageWidget extends WidgetType {
     image.alt = this.alt;
     image.loading = 'lazy';
     preview.addEventListener('click', () => revealSource(view, this.position));
+    image.addEventListener('load', () => { if (container.isConnected) view.requestMeasure(); });
+    const properties = document.createElement('button');
+    properties.type = 'button'; properties.className = 'cm-widget-source-button cm-image-properties';
+    properties.textContent = '图片属性';
+    properties.addEventListener('click', () => inspectResource(view, this.position));
     image.addEventListener('error', () => {
       preview.remove();
       const error = document.createElement('div');
@@ -51,6 +57,7 @@ export class ImageWidget extends WidgetType {
     });
     preview.appendChild(image);
     container.appendChild(preview);
+    container.appendChild(properties);
     return container;
   }
 
@@ -71,14 +78,14 @@ export function collectImageRanges(
       enter(node) {
         if (node.name !== 'Image') return;
         const url = node.node.getChild('URL');
-        const label = node.node.getChild('LinkText');
+        const marks = node.node.getChildren('LinkMark');
         if (!url) return;
         const line = state.doc.lineAt(node.from);
         images.push({
           from: node.from,
           to: node.to,
           source: state.sliceDoc(url.from, url.to),
-          alt: label ? state.sliceDoc(label.from, label.to) : '',
+          alt: marks.length >= 2 ? state.sliceDoc(marks[0].to, marks[1].from).replace(/\\([\\[\]])/g, '$1') : '',
           block: line.text.trim() === state.sliceDoc(node.from, node.to).trim(),
         });
       },

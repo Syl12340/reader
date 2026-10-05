@@ -1,4 +1,5 @@
 import { StateEffect, StateField, type EditorState, type Extension } from '@codemirror/state';
+import { syntaxTree } from '@codemirror/language';
 import {
   Decoration,
   EditorView,
@@ -30,7 +31,7 @@ import {
 } from '$lib/editor/decorations/image';
 import { MathWidget } from '$lib/editor/decorations/math';
 import { TaskWidget } from '$lib/editor/decorations/task';
-import { CodeWidget, MermaidWidget } from '$lib/editor/decorations/code';
+import { CodeWidget, MermaidWidget, ChartWidget } from '$lib/editor/decorations/code';
 import { TableWidget } from '$lib/editor/decorations/table';
 import { collectMarkerDecorations } from '$lib/editor/decorations/marker';
 import { resolveImageSrc } from './markdown';
@@ -44,14 +45,16 @@ interface ScanCache {
 
 const SCAN_MARGIN = 10_000;
 const scansByDocument = new WeakMap<object, Map<string, ScanCache>>();
+const interactionState = StateEffect.define<{ composing?: boolean; dragging?: boolean }>();
 
-function scanDocument(text: string): ScanCache {
+function scanDocument(text: string, excluded: SourceRange[] = []): ScanCache {
   const fences = scanFencedBlocks(text);
+  const codeRanges = [...fences, ...excluded];
   return {
     fences,
-    math: scanMath(text, fences),
-    tasks: scanTasks(text, fences),
-    tables: scanTables(text, fences),
+    math: scanMath(text, codeRanges),
+    tasks: scanTasks(text, codeRanges),
+    tables: scanTables(text, codeRanges),
   };
 }
 
@@ -83,7 +86,7 @@ function expandedScanRanges(
   visibleRanges: readonly SourceRange[],
 ): SourceRange[] {
   const expanded = visibleRanges.map(range => {
-    const roughFrom = Math.max(0, range.from - SCAN_MARGIN);
+    const roughFrom = Math.min(state.doc.length, Math.max(0, range.from - SCAN_MARGIN));
     const roughTo = Math.min(state.doc.length, range.to + SCAN_MARGIN);
     return {
       from: state.doc.lineAt(roughFrom).from,
@@ -120,7 +123,13 @@ function scansForState(
 
   const scans: ScanCache = { fences: [], math: [], tasks: [], tables: [] };
   for (const range of scanRanges) {
-    mergeScanCache(scans, scanDocument(state.sliceDoc(range.from, range.to)), range.from);
+    const excluded: SourceRange[] = [];
+    syntaxTree(state).iterate({ from: range.from, to: range.to, enter(node) {
+      if (!/^(FencedCode|CodeBlock|InlineCode)$/.test(node.name)) return;
+      excluded.push({ from: node.from - range.from, to: node.to - range.from });
+      return false;
+    } });
+    mergeScanCache(scans, scanDocument(state.sliceDoc(range.from, range.to), excluded), range.from);
   }
   documentCache.set(cacheKey, scans);
   if (documentCache.size > 24) {
@@ -155,11 +164,14 @@ function createDecorations(
   };
 
   for (const item of scans.fences) {
-    if (!inVisibleRange(item, visibleRanges) || active(item)) continue;
+    if (item.closed === false || !inVisibleRange(item, visibleRanges) || active(item)) continue;
     addReplacement(
       item,
       item.language === 'mermaid'
         ? new MermaidWidget(item, context.theme, version)
+        : item.language === 'chart' ? new ChartWidget(item, context.theme)
+        : ['latex', 'math', 'tex'].includes(item.language)
+          ? new MathWidget({ ...item, source: item.code, display: true }, true, context.theme)
         : new CodeWidget(item, context.theme, version),
       true,
     );
@@ -167,7 +179,7 @@ function createDecorations(
 
   for (const item of scans.tables) {
     if (!inVisibleRange(item, visibleRanges) || active(item) || isCovered(item, covered)) continue;
-    addReplacement(item, new TableWidget(item, sessionId), true);
+    addReplacement(item, new TableWidget(item, sessionId, context.filePath), true);
   }
 
   for (const item of scans.math) {
@@ -222,6 +234,8 @@ export function createMarkdownDecorations(
     scans: ScanCache;
     version: number;
     visibleRanges: readonly SourceRange[];
+    composing: boolean;
+    dragging: boolean;
   }
 
   const setVisibleRanges = StateEffect.define<readonly SourceRange[]>();
@@ -238,27 +252,43 @@ export function createMarkdownDecorations(
         scans,
         visibleRanges,
         version: 0,
+        composing: false,
+        dragging: false,
         decorations: createDecorations(state, visibleRanges, context, sessionId, scans, '0'),
       };
     },
     update(value, transaction) {
-      let visibleRanges = value.visibleRanges;
+      let visibleRanges = transaction.docChanged ? value.visibleRanges.map(range => ({
+        from: transaction.changes.mapPos(range.from, -1), to: transaction.changes.mapPos(range.to, 1),
+      })) : value.visibleRanges;
+      let composing = value.composing, dragging = value.dragging;
       for (const effect of transaction.effects) {
         if (effect.is(setVisibleRanges)) visibleRanges = effect.value;
+        if (effect.is(interactionState)) {
+          composing = effect.value.composing ?? composing;
+          dragging = effect.value.dragging ?? dragging;
+        }
       }
+      // Keep the DOM stable while the IME or pointer owns the selection.
+      if (composing || dragging) return { ...value, composing, dragging, visibleRanges,
+        decorations: value.decorations.map(transaction.changes),
+        version: value.version + (transaction.docChanged ? 1 : 0) };
+      const released = value.composing || value.dragging;
       const visibleRangesChanged = visibleRanges !== value.visibleRanges;
-      const scans = transaction.docChanged || visibleRangesChanged
+      const scans = transaction.docChanged || visibleRangesChanged || released
         ? scansForState(transaction.state, visibleRanges)
         : value.scans;
       const version = transaction.docChanged ? value.version + 1 : value.version;
       const shouldUpdate = transaction.docChanged
         || transaction.selection
-        || visibleRangesChanged;
+        || visibleRangesChanged || released;
       if (!shouldUpdate) return value;
 
       return {
         scans,
         visibleRanges,
+        composing,
+        dragging,
         version,
         decorations: createDecorations(
           transaction.state,
@@ -279,9 +309,20 @@ export function createMarkdownDecorations(
   const viewportSync = ViewPlugin.fromClass(class {
     private scheduled = false;
     private destroyed = false;
+    private releasePointer = () => this.defer({ dragging: false });
 
     constructor(readonly view: EditorView) {
+      view.dom.ownerDocument.addEventListener('pointerup', this.releasePointer);
+      view.dom.ownerDocument.addEventListener('pointercancel', this.releasePointer);
       this.schedule();
+    }
+
+    freeze(value: { composing?: boolean; dragging?: boolean }) {
+      this.view.dispatch({ effects: interactionState.of(value) });
+    }
+
+    defer(value: { composing?: boolean; dragging?: boolean }) {
+      queueMicrotask(() => { if (!this.destroyed) this.freeze(value); });
     }
 
     update(update: ViewUpdate) {
@@ -290,6 +331,8 @@ export function createMarkdownDecorations(
 
     destroy() {
       this.destroyed = true;
+      this.view.dom.ownerDocument.removeEventListener('pointerup', this.releasePointer);
+      this.view.dom.ownerDocument.removeEventListener('pointercancel', this.releasePointer);
     }
 
     private schedule() {
@@ -305,7 +348,15 @@ export function createMarkdownDecorations(
         });
       });
     }
-  });
+  }, { eventHandlers: {
+    compositionstart() { this.freeze({ composing: true }); },
+    compositionend() { this.defer({ composing: false }); },
+    pointerdown(event) {
+      if (event.button === 0 && event.target instanceof Element && event.target.closest('.cm-content')
+        && !event.target.closest('.cm-block-widget, input, button, a')) this.freeze({ dragging: true });
+    },
+    blur() { this.defer({ composing: false, dragging: false }); },
+  } });
 
   return [field, viewportSync];
 }

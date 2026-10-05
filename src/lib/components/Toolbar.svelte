@@ -1,26 +1,38 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { get } from 'svelte/store';
-  import { theme, setThemePreset } from '$lib/stores/theme';
+  import { theme, themePreset, setThemePreset } from '$lib/stores/theme';
   import { isDirty, currentFile, fileName, fileContent } from '$lib/stores/document';
-  import { editorMode, typewriterMode, focusMode, setEditorMode } from '$lib/stores/ui';
-  import { exportAsHTML } from '$lib/utils/native-fs';
+  import { editorMode, typewriterMode, focusMode } from '$lib/stores/ui';
   import { isTauri } from '$lib/utils/platform';
   import { THEME_PRESETS, type ThemePreset } from '$lib/themes';
-  import { exportAsDocx, exportAsEpub, exportAsLatex, exportAsMarkdownVariant, exportAsImage } from '$lib/utils/export-formats';
-  import { activeSessionId } from '$lib/stores/document';
+  import { exportAsDocx, exportAsEpub, exportAsLatex, exportAsMarkdownVariant, exportAsImage, saveExportFile, type ExportWriteOptions } from '$lib/utils/export-formats';
+  import { activeSessionId, sessions } from '$lib/stores/document';
   import { DocumentService } from '$lib/services/document';
-  import { WorkspaceService } from '$lib/services/workspace';
   import { CommandService } from '$lib/services/command';
   import { prepareExportDocument } from '$lib/services/export-document';
+  import ExportPreview from './ExportPreview.svelte';
+  import { exportTypography, type ExportSource } from '$lib/utils/export-options';
+  import { ExportHistory, type ExportFormat } from '$lib/services/export-history';
+  import { buildExportHtml as createExportHtml, fitPrintFormulas, type ExportTypography } from '$lib/utils/export-html';
   import { shortcutBindings } from '$lib/services/shortcut';
   import { menuNavigation } from '$lib/utils/menu-navigation';
-  import { settings } from '$lib/stores/settings';
+  import { settings, type Settings } from '$lib/stores/settings';
+  import { exportJob, cancelExport, checkExportSignal, withExportJob, type ExportStage } from '$lib/services/export-job';
+  import { dialogFocus } from '$lib/utils/dialog-focus';
+  import { buildInfo, buildTimeLabel, runtimeDiagnostics, diagnosticText } from '$lib/utils/build-info';
+  import { notify, confirmAction, ask } from '$lib/services/interaction';
+  import { anchoredMenu } from '$lib/utils/menu-position';
+  import type { EditorMode } from '$lib/types';
 
   const shortcut = (id: string) => $shortcutBindings.find(item => item.id === id)?.key ?? '';
   function runMenuCommand(id: string) {
     closeAllMenus();
     void CommandService.execute(id);
+  }
+  function selectMode(mode: EditorMode) {
+    closeAllMenus();
+    void CommandService.execute(mode === 'wysiwym' ? 'modeWrite' : mode === 'source' ? 'modeSource' : 'modeRead');
   }
 
   let { showSidebar, showPreview, recentFiles = [], autoSaveEnabled = false, onToggleSidebar, onTogglePreview, onToggleTheme, onToggleAutoSave, onOpenSettings }: {
@@ -43,6 +55,18 @@
   let showThemeSubmenu = $state(false);
   let showExportSubmenu = $state(false);
   let showAboutDialog = $state(false);
+  let diagnostics = $state({ executable: '正在读取…', platform: isTauri() ? 'Tauri 桌面' : '浏览器', nativeVersion: '' });
+  $effect(() => {
+    if (!showAboutDialog) return;
+    let cancelled = false;
+    void runtimeDiagnostics().then(value => { if (!cancelled) diagnostics = { ...value, nativeVersion: value.nativeVersion ?? '' }; })
+      .catch(error => { if (!cancelled) diagnostics = { executable: `读取失败：${String(error)}`, platform: isTauri() ? 'Tauri 桌面' : '浏览器', nativeVersion: '' }; });
+    return () => { cancelled = true; };
+  });
+  async function copyDiagnostics() {
+    try { await navigator.clipboard.writeText(diagnosticText(diagnostics)); notify('诊断信息已复制，不包含文档内容。', undefined, false); }
+    catch (error) { notify(`复制诊断信息失败：${String(error)}`); }
+  }
   let menuHoverEnabled = $state(false);
   let closeTimer: ReturnType<typeof setTimeout> | null = null;
   type TauriWindowControls = {
@@ -143,8 +167,19 @@
       showWindowControls = true;
       void getAppWindow();
     }
-    const unregister = CommandService.register('printDocument', printDocument);
-    return () => { cancelClose(); unregister(); };
+    const registrations = [
+      ['printDocument', printDocument], ['exportPdf', exportPDF], ['exportDefault', exportDefault],
+      ['exportHTML', exportHTML], ['exportDOCX', exportDOCX], ['exportEPUB', exportEPUB],
+      ['exportLaTeX', exportLaTeX], ['exportImage', () => exportImage()],
+      ['exportGfm', () => exportMarkdownVariant('gfm')], ['exportCommonMark', () => exportMarkdownVariant('commonmark')],
+      ['exportPrevious', exportPrevious],
+      ['exportPreview', openExportPreview],
+    ] as const;
+    const cleanups = registrations.map(([id, handler]) => CommandService.register(id, handler, {
+      enabled: () => !!get(activeSessionId) && !get(exportJob) && !previewSource && (id !== 'exportPrevious' || !!previousExports.get(captureExportSource(), get(settings))),
+      unavailable: id === 'exportPrevious' ? '当前文档尚无成功的导出记录，或正在导出。' : '请先打开文档，并等待当前导出结束。',
+    }));
+    return () => { cancelClose(); cancelExport(); cleanups.forEach(cleanup => cleanup()); };
   });
 
   // 新建文件
@@ -152,297 +187,6 @@
     void CommandService.execute('newFile');
   }
 
-  function escapeHtml(value: string): string {
-    return value
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-  }
-
-  function sanitizeStaticExportHtml(html: string): string {
-    if (typeof DOMParser === 'undefined') {
-      return html
-        .replace(/<button\b[^>]*class=(["'])[^"']*\bcopy-button\b[^"']*\1[^>]*>.*?<\/button>/gis, '')
-        .replace(/<script\b[^>]*>.*?<\/script>/gis, '')
-        .replace(/\s+on[a-z]+\s*=\s*(["']).*?\1/gi, '')
-        .replace(/\s+on[a-z]+\s*=\s*[^\s>]+/gi, '');
-    }
-
-    const doc = new DOMParser().parseFromString(`<body>${html}</body>`, 'text/html');
-    doc.querySelectorAll('button, .copy-button, [data-export-hidden], script').forEach((node) => {
-      node.remove();
-    });
-    doc.querySelectorAll<HTMLElement>('*').forEach((node) => {
-      for (const attr of Array.from(node.attributes)) {
-        if (/^on/i.test(attr.name)) {
-          node.removeAttribute(attr.name);
-        }
-      }
-    });
-    return doc.body.innerHTML;
-  }
-
-  function buildExportHtml(title: string, bodyHtml: string, mode: 'light' | 'dark', embeddedCss = '', includeStyles = true) {
-    const safeTitle = escapeHtml(title || 'untitled');
-    const safeBodyHtml = sanitizeStaticExportHtml(bodyHtml);
-    const styleOpen = '<' + 'style>';
-    const styleClose = '<' + '/style>';
-    const html = `<!DOCTYPE html>
-<html lang="zh-CN" data-theme="${mode}">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${safeTitle}</title>
-  ${styleOpen}
-    ${embeddedCss}
-    :root {
-      --font-ui: 'Space Grotesk', 'Noto Sans', sans-serif;
-      --font-content: 'Source Serif 4', 'Noto Serif SC', serif;
-      --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
-      --bg-primary: #f8f6f1;
-      --bg-secondary: #f1eee7;
-      --bg-tertiary: #e6e2da;
-      --text-primary: #22211f;
-      --text-secondary: #6a665f;
-      --text-tertiary: #9a948a;
-      --border-color: #e0dbd1;
-      --accent-color: #3a6ff7;
-      --code-bg: #f3efe7;
-      --code-text: #b84c6b;
-      --link-color: #2f65e8;
-      --blockquote-border: #c7b79c;
-      --blockquote-bg: #f5f1e8;
-    }
-
-    [data-theme="dark"] {
-      --bg-primary: #1e1c1a;
-      --bg-secondary: #262421;
-      --bg-tertiary: #2f2c28;
-      --text-primary: #f2efe8;
-      --text-secondary: #b1aaa0;
-      --text-tertiary: #7d756b;
-      --border-color: #3a3530;
-      --accent-color: #7aa2ff;
-      --code-bg: #2a2723;
-      --code-text: #f19fb5;
-      --link-color: #8db0ff;
-      --blockquote-border: #5d5241;
-      --blockquote-bg: #26231f;
-    }
-
-    * { box-sizing: border-box; }
-
-    body {
-      margin: 0;
-      padding: 32px 24px 64px;
-      background: var(--bg-primary);
-      color: var(--text-primary);
-      font-family: var(--font-content);
-      line-height: 1.85;
-    }
-
-    .markdown-body {
-      max-width: 860px;
-      margin: 0 auto;
-      font-size: 16.5px;
-      letter-spacing: 0.01em;
-    }
-
-    .markdown-body h1,
-    .markdown-body h2,
-    .markdown-body h3,
-    .markdown-body h4,
-    .markdown-body h5,
-    .markdown-body h6 {
-      margin-top: 24px;
-      margin-bottom: 16px;
-      font-weight: 600;
-      line-height: 1.25;
-    }
-
-    .markdown-body h1 {
-      font-size: 2em;
-      border-bottom: 1px solid var(--border-color);
-      padding-bottom: 0.3em;
-    }
-
-    .markdown-body h2 {
-      font-size: 1.5em;
-      border-bottom: 1px solid var(--border-color);
-      padding-bottom: 0.3em;
-    }
-
-    .markdown-body h3 { font-size: 1.25em; }
-
-    .markdown-body p { margin-bottom: 16px; }
-
-    .markdown-body a { color: var(--link-color); text-decoration: none; }
-    .markdown-body a:hover { text-decoration: underline; }
-
-    .markdown-body strong { font-weight: 600; }
-    .markdown-body em { font-style: italic; }
-
-    .markdown-body code {
-      background: var(--code-bg);
-      color: var(--code-text);
-      padding: 0.2em 0.4em;
-      border-radius: 3px;
-      font-family: var(--font-mono);
-      font-size: 0.9em;
-    }
-
-    .markdown-body pre {
-      background: var(--code-bg);
-      border-radius: 6px;
-      padding: 16px;
-      overflow-x: auto;
-      margin-bottom: 16px;
-    }
-
-    .markdown-body pre code {
-      background: transparent;
-      color: inherit;
-      padding: 0;
-      font-size: 0.9em;
-      line-height: 1.5;
-    }
-
-    .markdown-body blockquote {
-      border-left: 4px solid var(--blockquote-border);
-      background: var(--blockquote-bg);
-      padding: 16px;
-      margin: 0 0 16px 0;
-      border-radius: 0 6px 6px 0;
-    }
-
-    .markdown-body blockquote p { margin-bottom: 0; }
-
-    .markdown-body ul,
-    .markdown-body ol {
-      padding-left: 2em;
-      margin-bottom: 16px;
-    }
-
-    .markdown-body li { margin-bottom: 0.25em; }
-
-    .markdown-body img {
-      max-width: 100%;
-      height: auto;
-      border-radius: 6px;
-    }
-
-    .markdown-body table {
-      border-collapse: collapse;
-      width: 100%;
-      margin-bottom: 16px;
-    }
-
-    .markdown-body th,
-    .markdown-body td {
-      border: 1px solid var(--border-color);
-      padding: 8px 12px;
-      text-align: left;
-    }
-
-    .markdown-body th {
-      background: var(--bg-secondary);
-      font-weight: 600;
-    }
-
-    .markdown-body tr:nth-child(even) {
-      background: var(--bg-secondary);
-    }
-
-    .markdown-body hr {
-      border: none;
-      border-top: 1px solid var(--border-color);
-      margin: 24px 0;
-    }
-
-    .katex-display {
-      overflow-x: auto;
-      overflow-y: hidden;
-      padding: 16px 0;
-    }
-
-    .katex { font-size: 1.1em; }
-
-    .code-block {
-      margin: 1.1em 0;
-      break-inside: avoid;
-      page-break-inside: avoid;
-    }
-
-    .code-header {
-      display: block;
-      font-size: 12px;
-      color: var(--text-tertiary);
-      padding: 0 0 6px;
-    }
-
-    .code-language {
-      font-family: var(--font-mono);
-      letter-spacing: 0.02em;
-    }
-
-    .code-block-pre {
-      margin-top: 0;
-      margin-bottom: 0;
-    }
-
-    .markdown-body button,
-    .markdown-body .copy-button,
-    .markdown-body [data-export-hidden] {
-      display: none !important;
-    }
-
-    @media print {
-      @page {
-        margin: 20mm 15mm;
-      }
-      body {
-        padding: 0;
-        background: #ffffff !important;
-        color: #333333 !important;
-      }
-      .markdown-body {
-        max-width: 100%;
-      }
-      .markdown-body tr {
-        break-inside: avoid;
-        page-break-inside: avoid;
-      }
-      .code-block, .markdown-body pre, .markdown-body table {
-        break-inside: auto;
-        page-break-inside: auto;
-      }
-      .markdown-body pre { white-space: pre-wrap; overflow: visible; overflow-wrap: anywhere; }
-      .markdown-body pre code { white-space: inherit; }
-      .markdown-body thead { display: table-header-group; }
-      .markdown-body h1, .markdown-body h2, .markdown-body h3, .code-header { break-after: avoid; }
-      .markdown-body p { orphans: 3; widows: 3; }
-      .katex-display { overflow: visible; max-width: 100%; }
-      a {
-        color: #333333 !important;
-        text-decoration: none !important;
-      }
-      * {
-        -webkit-print-color-adjust: exact !important;
-        print-color-adjust: exact !important;
-      }
-    }
-  ${styleClose}
-</head>
-<body>
-  <div class="markdown-body">
-    ${safeBodyHtml}
-  </div>
-</body>
-</html>`;
-    return includeStyles ? html : html.replace(/<style>[\s\S]*?<\/style>/, '');
-  }
 
   // 打开文件
   async function handleOpenFile() {
@@ -451,7 +195,7 @@
 
   // 打开文件夹
   async function handleOpenFolder() {
-    await WorkspaceService.openFolder();
+    await CommandService.execute('openFolder');
   }
 
   // 保存文件
@@ -470,48 +214,125 @@
     markdown: string;
     filePath: string | null;
     theme: 'light' | 'dark';
+    typography: ExportTypography;
+    sessionId: string;
+    preferences: Settings;
+    write: ExportWriteOptions;
+    signal: AbortSignal;
+    stage: (value: ExportStage) => void;
   };
-  let exportInProgress = $state(false);
+  const exportInProgress = $derived($exportJob !== null);
+  let previewSource = $state<ExportSource | null>(null);
+  let previewPreferences = $state<Settings>(get(settings));
+  function captureExportSource(): ExportSource | null {
+    const sessionId = get(activeSessionId);
+    return sessionId ? { sessionId, baseName: get(fileName) || 'untitled.md', markdown: get(fileContent),
+      filePath: get(currentFile), theme: get(theme) } : null;
+  }
+  function openExportPreview() {
+    previewSource = captureExportSource(); previewPreferences = { ...get(settings) };
+  }
+  function closeExportPreview() {
+    previewSource = null;
+    void tick().then(() => {
+      if (previewSource || get(exportJob) || document.querySelector('[aria-modal="true"]')) return;
+      document.querySelector<HTMLElement>('[data-testid="file-menu-trigger"]')?.focus({ preventScroll: true });
+    });
+  }
+  function confirmExportPreview(format: 'html' | 'pdf', preferences: Settings, prepared: Awaited<ReturnType<typeof prepareExportDocument>>) {
+    const source = previewSource ? { ...previewSource, theme: 'light' as const } : null;
+    previewSource = null;
+    if (!source) return;
+    if (format === 'pdf') void exportPDF(preferences, source, prepared);
+    else void exportHTML(preferences, source, prepared);
+  }
+  const previousExports = new ExportHistory();
+  const exportStages = { destination: '选择保存位置', render: '渲染文档', resources: '嵌入资源', write: '生成并写入文件' };
 
-  async function runExport(label: string, action: (snapshot: ExportSnapshot) => Promise<void>) {
-    if (exportInProgress || !get(activeSessionId)) return;
-    const baseName = $fileName || 'untitled.md';
-    const snapshot: ExportSnapshot = {
-      baseName,
-      title: baseName.replace(/\.[^/.]+$/, '') || 'untitled',
-      markdown: $fileContent,
-      filePath: $currentFile,
-      theme: $theme,
-    };
-    exportInProgress = true;
+  async function runExport(label: string, action: (snapshot: ExportSnapshot) => Promise<void>, format: ExportFormat = 'print', preferences?: Settings, source?: ExportSource) {
+    const capturedSource = source ?? captureExportSource();
+    if (exportInProgress || !capturedSource) return;
+    const { sessionId, baseName } = capturedSource;
+    const captured = { ...(preferences ?? get(settings)) };
+    const capturedContent = capturedSource.markdown, capturedPath = capturedSource.filePath, capturedTheme = capturedSource.theme;
+    let savedPath: string | undefined;
     try {
+      const completed = await withExportJob(label, async (signal, stage) => {
+      const extension = ({ latex: 'tex', gfm: 'gfm.md', commonmark: 'cm.md', github: 'github.md', print: '' } as Record<string, string>)[format] ?? format;
+      const title = baseName.replace(/\.[^/.]+$/, '') || 'untitled';
+      let path: string | undefined;
+      if (isTauri() && format !== 'print') {
+        const { saveExportDialog } = await import('$lib/utils/tauri-fs');
+        const selected = await saveExportDialog(`${title}.${extension}`, extension.split('.').pop()!, label);
+        if (!selected) throw new DOMException('Export canceled', 'AbortError');
+        path = selected.toLowerCase().endsWith(`.${extension}`) ? selected : `${selected}.${extension}`;
+        if (get(sessions).some(session => session.path && path!.replace(/\\/g, '/').toLowerCase() === session.path.replace(/\\/g, '/').toLowerCase())) {
+          throw new Error('导出目标不能覆盖已打开的源文件。');
+        }
+      }
+      checkExportSignal(signal);
+      const snapshot: ExportSnapshot = {
+      baseName,
+      title,
+      markdown: capturedContent,
+      filePath: capturedPath,
+      theme: capturedTheme,
+      typography: exportTypography(captured),
+      sessionId, preferences: captured, signal, stage,
+      write: { path, signal, onWrite: () => stage('write') },
+    };
+      stage('render');
       await action(snapshot);
+      checkExportSignal(signal);
+      if (format !== 'print' && !(format === 'pdf' && !isTauri())) previousExports.record(capturedSource, format, captured);
+      savedPath = path;
+      });
+      const completionMessage = !isTauri() && format === 'pdf'
+        ? '已打开打印对话框，请在其中选择保存为 PDF；Reader 无法确认是否保存成功。'
+        : `${label} 导出完成${isTauri() ? '' : '，已提交浏览器下载'}。`;
+      if (completed && format !== 'print') notify(completionMessage, savedPath ? {
+        label: '打开 / 定位', run: async () => {
+          const choice = await ask({ title: '导出完成', message: savedPath!, actions: [
+            { id: 'cancel', label: '关闭' }, { id: 'reveal', label: '所在文件夹' }, { id: 'open', label: '打开文件' },
+          ] });
+          if (choice === 'cancel') return;
+          const { invoke } = await import('@tauri-apps/api/core');
+          await invoke('open_document_path', { path: savedPath, reveal: choice === 'reveal' });
+        },
+      } : undefined, false);
     } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') { notify('已取消导出，未提交新的文件写入。', undefined, false); return; }
       console.error(`${label} export failed:`, error);
-      alert(`${label} 导出失败：${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      exportInProgress = false;
+      notify(`${label} 导出失败：${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  function buildExportHtml(snapshot: ExportSnapshot, html: string, css = '', styled = true) {
+    return createExportHtml(snapshot.title, html, snapshot.theme, css, styled, snapshot.typography);
   }
 
   async function runPreparedExport(
     label: string,
     mode: 'light' | 'current',
     action: (snapshot: ExportSnapshot, prepared: Awaited<ReturnType<typeof prepareExportDocument>>) => Promise<void>,
+    format: ExportFormat = 'print', preferences?: Settings,
+    source?: ExportSource, preparedSnapshot?: Awaited<ReturnType<typeof prepareExportDocument>>,
   ) {
     await runExport(label, async snapshot => {
       if (mode === 'light') snapshot.theme = 'light';
-      const prepared = await prepareExportDocument(snapshot.markdown, snapshot.filePath, snapshot.theme);
-      if (prepared.warnings?.length && !confirm(`导出存在以下问题：\n${prepared.warnings.join('\n')}\n\n是否仍然继续？`)) return;
+      const prepared = preparedSnapshot ?? await prepareExportDocument(snapshot.markdown, snapshot.filePath, snapshot.theme, {
+        signal: snapshot.signal, onResources: () => snapshot.stage('resources'),
+      });
+      if (prepared.warnings?.length && !await confirmAction('导出资源异常', `导出存在以下问题：\n${prepared.warnings.join('\n')}\n\n是否仍然继续？`, '仍然导出')) throw new DOMException('Export canceled', 'AbortError');
+      checkExportSignal(snapshot.signal);
       await action(snapshot, prepared);
-    });
+    }, format, preferences, source);
   }
 
-  async function exportHTML() {
+  async function exportHTML(preferences?: Settings, source?: ExportSource, prepared?: Awaited<ReturnType<typeof prepareExportDocument>>) {
     await runPreparedExport('HTML', 'current', (snapshot, prepared) =>
-      exportAsHTML(snapshot.baseName, buildExportHtml(
-        snapshot.title, prepared.bodyHtml, snapshot.theme, prepared.embeddedCss, $settings.exportIncludeCss,
-      )),
+      saveExportFile(`${snapshot.title}.html`, buildExportHtml(snapshot, prepared.bodyHtml, prepared.embeddedCss, snapshot.preferences.exportIncludeCss), 'text/html', 'HTML Document', snapshot.write),
+      'html', preferences, source, prepared,
     );
   }
 
@@ -524,12 +345,27 @@
     }
   }
 
+  async function exportPrevious() {
+    const previous = previousExports.get(captureExportSource(), get(settings));
+    if (!previous) return;
+    const { format, preferences } = previous;
+    if (format === 'html') await exportHTML(preferences);
+    else if (format === 'pdf') await exportPDF(preferences);
+    else if (format === 'docx') await exportDOCX(preferences);
+    else if (format === 'epub') await exportEPUB(preferences);
+    else if (format === 'latex') await exportLaTeX(preferences);
+    else if (format === 'png' || format === 'jpg') await exportImage(format, preferences);
+    else if (format === 'gfm' || format === 'commonmark' || format === 'github') await exportMarkdownVariant(format, preferences);
+  }
+
   const exportFormatLabel = $derived(({ html: 'HTML', pdf: 'PDF', docx: 'Word', epub: 'EPUB' } as Record<string, string>)[$settings.exportDefaultFormat] ?? 'HTML');
 
   // 打印当前页面
   async function printDocument() {
-    await runPreparedExport('打印', 'light', (snapshot, prepared) =>
-      printHtmlInBrowser(buildExportHtml(snapshot.title, prepared.bodyHtml, snapshot.theme, prepared.embeddedCss)),
+    await runPreparedExport('打印', 'light', async (snapshot, prepared) => {
+      snapshot.stage('write');
+      await printHtmlInBrowser(buildExportHtml(snapshot, prepared.bodyHtml, prepared.embeddedCss));
+    },
     );
   }
 
@@ -541,7 +377,8 @@
     const frame = document.createElement('iframe');
     frame.title = 'PDF export print frame';
     frame.setAttribute('aria-hidden', 'true');
-    frame.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;opacity:0;pointer-events:none;';
+    frame.tabIndex = -1;
+    frame.style.cssText = 'position:fixed;left:-10000px;top:0;width:800px;height:1px;border:0;opacity:0;pointer-events:none;';
     document.body.appendChild(frame);
     let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
     const cleanup = () => {
@@ -579,6 +416,14 @@
       }
 
       frameWindow.focus();
+      const main = frameDocument.querySelector<HTMLElement>('.markdown-body');
+      const width = Number(frameDocument.querySelector('meta[name="reader-print-width"]')?.getAttribute('content')) || 170;
+      frame.style.width = `${width * 96 / 25.4}px`;
+      const measureStyle = frameDocument.createElement('style');
+      measureStyle.textContent = '@media screen { body { padding:0 !important; } .markdown-body { max-width:100% !important; } }';
+      frameDocument.head.append(measureStyle);
+      if (main) void main.offsetWidth;
+      fitPrintFormulas(frameDocument);
       frameWindow.addEventListener('afterprint', cleanup, { once: true });
       cleanupTimer = setTimeout(cleanup, 120_000);
       frameWindow.print();
@@ -590,45 +435,45 @@
 
 
   // 导出为 PDF（使用 Typora 风格的原生静默打印引擎）
-  async function exportPDF() {
+  async function exportPDF(preferences?: Settings, source?: ExportSource, prepared?: Awaited<ReturnType<typeof prepareExportDocument>>) {
     await runPreparedExport('PDF', 'light', async (snapshot, prepared) => {
-      const htmlContent = buildExportHtml(snapshot.title, prepared.bodyHtml, snapshot.theme, prepared.embeddedCss);
+      if (!isTauri() && snapshot.preferences.exportBookmarks) throw new Error('浏览器打印不支持自动生成 PDF 书签，请关闭该选项或使用桌面版。');
+      const htmlContent = buildExportHtml(snapshot, prepared.bodyHtml, prepared.embeddedCss);
+      snapshot.stage('write');
       if (isTauri()) {
         const { invoke } = await import('@tauri-apps/api/core');
-        const { saveExportDialog } = await import('$lib/utils/tauri-fs');
-        const selectedPath = await saveExportDialog(snapshot.title, 'pdf', 'PDF Document');
-        if (!selectedPath) return; // User cancelled
-        
-        await invoke('export_pdf_native', { path: selectedPath, htmlContent });
+        await invoke('export_pdf_native', { path: snapshot.write.path, htmlContent, paper: snapshot.preferences.exportPaper,
+          marginMm: snapshot.preferences.exportMargin, landscape: snapshot.preferences.exportOrientation === 'landscape',
+          bookmarks: snapshot.preferences.exportBookmarks, pageNumbers: snapshot.preferences.exportPageNumbers });
       } else {
         await printHtmlInBrowser(htmlContent);
       }
-    });
+    }, 'pdf', preferences, source, prepared);
   }
 
   // 导出为 DOCX
-  async function exportDOCX() {
-    await runPreparedExport('DOCX', 'light', (snapshot, prepared) => exportAsDocx(snapshot.title, prepared.bodyHtml));
+  async function exportDOCX(preferences?: Settings) {
+    await runPreparedExport('DOCX', 'light', (snapshot, prepared) => exportAsDocx(snapshot.title, prepared.bodyHtml, snapshot.write), 'docx', preferences);
   }
 
   // 导出为 EPUB
-  async function exportEPUB() {
-    await runPreparedExport('EPUB', 'light', (snapshot, prepared) => exportAsEpub(snapshot.title, prepared.bodyHtml, undefined, prepared.embeddedCss));
+  async function exportEPUB(preferences?: Settings) {
+    await runPreparedExport('EPUB', 'light', (snapshot, prepared) => exportAsEpub(snapshot.title, prepared.bodyHtml, undefined, prepared.embeddedCss, snapshot.write), 'epub', preferences);
   }
 
   // 导出为 LaTeX
-  async function exportLaTeX() {
-    await runExport('LaTeX', snapshot => exportAsLatex(snapshot.title, snapshot.markdown));
+  async function exportLaTeX(preferences?: Settings) {
+    await runExport('LaTeX', snapshot => exportAsLatex(snapshot.title, snapshot.markdown, snapshot.write), 'latex', preferences);
   }
 
   // 导出为 Markdown 变体
-  async function exportMarkdownVariant(variant: 'gfm' | 'commonmark' | 'github') {
-    await runExport('Markdown', snapshot => exportAsMarkdownVariant(snapshot.title, snapshot.markdown, variant));
+  async function exportMarkdownVariant(variant: 'gfm' | 'commonmark' | 'github', preferences?: Settings) {
+    await runExport('Markdown', snapshot => exportAsMarkdownVariant(snapshot.title, snapshot.markdown, variant, snapshot.write), variant, preferences);
   }
 
   // 导出为图片
-  async function exportImage(format: 'png' | 'jpg' = 'png') {
-    await runPreparedExport('图片', 'light', (snapshot, prepared) => exportAsImage(snapshot.title, prepared.bodyHtml, format, prepared.embeddedCss));
+  async function exportImage(format: 'png' | 'jpg' = 'png', preferences?: Settings) {
+    await runPreparedExport('图片', 'light', (snapshot, prepared) => exportAsImage(snapshot.title, prepared.bodyHtml, format, prepared.embeddedCss, snapshot.write), format, preferences);
   }
 
   async function handleWindowControl(event: MouseEvent, action: 'minimize' | 'maximize' | 'close') {
@@ -668,14 +513,14 @@
   <div class="menubar" data-tauri-drag-region>
     <div class="menubar-left">
       <!-- 侧边栏切换 -->
-      <button class="menu-button" onclick={() => { void CommandService.execute('toggleSidebar'); }} aria-label={showSidebar ? 'Close library drawer' : 'Open library drawer'} title={`${showSidebar ? '隐藏' : '显示'}侧边栏 (${shortcut('toggleSidebar')})`}>
+      <button class="menu-button" onclick={() => { void CommandService.execute('toggleSidebar'); }} aria-label={showSidebar ? '隐藏侧栏' : '显示侧栏'} title={`${showSidebar ? '隐藏' : '显示'}侧边栏 (${shortcut('toggleSidebar')})`}>
         <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
           <line x1="9" y1="3" x2="9" y2="21"></line>
         </svg>
       </button>
 
-      <div class="menu-group" use:menuNavigation={closeAllMenus} role="menubar" tabindex="-1" data-tauri-drag-region="false" onmouseenter={cancelClose} onmouseleave={scheduleClose}>
+      <div class="menu-group" use:menuNavigation={closeAllMenus} role="menubar" aria-label="应用菜单" tabindex="-1" data-tauri-drag-region="false" onmouseenter={cancelClose} onmouseleave={scheduleClose}>
         <!-- 文件菜单 -->
         <div class="relative" use:clickOutside={() => closeMenuIfOpen('file')}>
           <button
@@ -692,6 +537,7 @@
               onmouseenter={cancelClose}
               onmouseleave={scheduleClose}
               role="menu"
+              use:anchoredMenu
               data-testid="file-menu"
               tabindex="-1"
             >
@@ -704,15 +550,23 @@
               <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => { handleOpenFolder(); closeAllMenus(); }}>
                 打开文件夹
               </button>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => runMenuCommand('quickOpen')}>
+                快速打开 <span class="float-right text-[var(--text-tertiary)]">{shortcut('quickOpen')}</span>
+              </button>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => runMenuCommand('reopenTab')}>
+                重新打开关闭的标签 <span class="float-right text-[var(--text-tertiary)]">{shortcut('reopenTab')}</span>
+              </button>
               <div class="border-t border-[var(--border-color)]"></div>
               <button
                 class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] disabled:opacity-50"
+                disabled={!$activeSessionId}
                 onclick={() => { saveFile(); closeAllMenus(); }}
               >
                 保存 <span class="float-right text-[var(--text-tertiary)]">{shortcut('saveFile')}</span>
               </button>
               <button
                 class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]"
+                disabled={!$activeSessionId}
                 onclick={() => { saveFileAs(); closeAllMenus(); }}
               >
                 另存为... <span class="float-right text-[var(--text-tertiary)]">{shortcut('saveAs')}</span>
@@ -723,7 +577,8 @@
                 <button
                   class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center justify-between"
                   data-testid="export-menu-trigger"
-                  onmouseenter={() => showExportSubmenu = true}
+                  disabled={!$activeSessionId || exportInProgress}
+                  onmouseenter={() => { if ($activeSessionId && !exportInProgress) showExportSubmenu = true; }}
                   aria-haspopup="menu" aria-expanded={showExportSubmenu}
                   onclick={() => showExportSubmenu = !showExportSubmenu}
                 >
@@ -735,37 +590,40 @@
                     onmouseenter={() => { cancelClose(); showExportSubmenu = true; }}
                     onmouseleave={() => { showExportSubmenu = false; scheduleClose(); }}
                     role="menu"
+                    use:anchoredMenu={true}
                     data-testid="export-submenu"
                     tabindex="-1"
                   >
-                    <button data-export-format="default" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportDefault(); closeAllMenus(); }}>
+                    <button data-export-format="default" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => runMenuCommand('exportDefault')}>
                       快速导出为 {exportFormatLabel}
                     </button>
+                    <button data-export-format="previous" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => runMenuCommand('exportPrevious')}>使用上次配置导出…</button>
+                    <button data-export-format="preview" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => runMenuCommand('exportPreview')}>导出预览与设置…</button>
                     <div class="border-t border-[var(--border-color)]"></div>
-                    <button data-export-format="html" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportHTML(); closeAllMenus(); }}>
+                    <button data-export-format="html" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => runMenuCommand('exportHTML')}>
                       HTML
                     </button>
-                    <button data-export-format="pdf" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportPDF(); closeAllMenus(); }}>
+                    <button data-export-format="pdf" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => runMenuCommand('exportPdf')}>
                       PDF
                     </button>
-                    <button data-export-format="docx" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportDOCX(); closeAllMenus(); }}>
+                    <button data-export-format="docx" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => runMenuCommand('exportDOCX')}>
                       Word (DOCX)
                     </button>
-                    <button data-export-format="epub" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportEPUB(); closeAllMenus(); }}>
+                    <button data-export-format="epub" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => runMenuCommand('exportEPUB')}>
                       电子书 (EPUB)
                     </button>
                     <div class="border-t border-[var(--border-color)]"></div>
-                    <button data-export-format="latex" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportLaTeX(); closeAllMenus(); }}>
+                    <button data-export-format="latex" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => runMenuCommand('exportLaTeX')}>
                       LaTeX (.tex)
                     </button>
-                    <button data-export-format="png" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportImage(); closeAllMenus(); }}>
+                    <button data-export-format="png" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => runMenuCommand('exportImage')}>
                       图片 (PNG)
                     </button>
                     <div class="border-t border-[var(--border-color)]"></div>
-                    <button data-export-format="gfm" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportMarkdownVariant('gfm'); closeAllMenus(); }}>
+                    <button data-export-format="gfm" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => runMenuCommand('exportGfm')}>
                       GFM Markdown
                     </button>
-                    <button data-export-format="commonmark" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => { exportMarkdownVariant('commonmark'); closeAllMenus(); }}>
+                    <button data-export-format="commonmark" class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm" onclick={() => runMenuCommand('exportCommonMark')}>
                       CommonMark
                     </button>
                   </div>
@@ -774,6 +632,7 @@
               <div class="border-t border-[var(--border-color)]"></div>
               <button
                 class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]"
+                disabled={!$activeSessionId || exportInProgress}
                 onclick={() => { void CommandService.execute('printDocument'); closeAllMenus(); }}
               >
                 打印 <span class="float-right text-[var(--text-tertiary)]">{shortcut('print')}</span>
@@ -781,12 +640,12 @@
               <div class="border-t border-[var(--border-color)]"></div>
               <button
                 class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center"
+                role="menuitemcheckbox" aria-checked={autoSaveEnabled}
                 onclick={() => { onToggleAutoSave(); closeAllMenus(); }}
               >
-                <span class="mr-2">{autoSaveEnabled ? '☑' : '☐'}</span>
                 自动保存
               </button>
-              {#if recentFiles.length > 0}
+              {#if isTauri() && recentFiles.length > 0}
                 <div class="border-t border-[var(--border-color)]"></div>
                 <div class="px-4 py-1 text-xs text-[var(--text-tertiary)]">最近文件</div>
                 {#each recentFiles.slice(0, 5) as recentPath}
@@ -818,6 +677,7 @@
               onmouseenter={cancelClose}
               onmouseleave={scheduleClose}
               role="menu"
+              use:anchoredMenu
               tabindex="-1"
             >
               {#each [{ id: 'undo', label: '撤销' }, { id: 'redo', label: '重做' }, { id: 'find', label: '查找' }, { id: 'replace', label: '替换' }] as item}
@@ -828,7 +688,7 @@
                 </button>
               {/each}
               <div class="border-t border-[var(--border-color)]"></div>
-              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => runMenuCommand('toggleRead')}>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" disabled={!$activeSessionId} onclick={() => runMenuCommand('toggleRead')}>
                 {$editorMode === 'preview' ? '返回编辑视图' : '阅读视图'} <span class="float-right text-[var(--text-tertiary)]">{shortcut('toggleRead')}</span>
               </button>
             </div>
@@ -850,36 +710,41 @@
               onmouseenter={cancelClose}
               onmouseleave={scheduleClose}
               role="menu"
+              use:anchoredMenu
               tabindex="-1"
             >
-              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => runMenuCommand('toggleSidebar')}>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" role="menuitemcheckbox" aria-checked={showSidebar} onclick={() => runMenuCommand('toggleSidebar')}>
                 {showSidebar ? '隐藏' : '显示'}侧边栏 <span class="float-right text-[var(--text-tertiary)]">{shortcut('toggleSidebar')}</span>
               </button>
-              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => runMenuCommand('togglePreview')}>
-                {showPreview ? 'Hide' : 'Show'} Split Preview <span class="float-right text-[var(--text-tertiary)]">{shortcut('togglePreview')}</span>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" disabled={!$activeSessionId}
+                role="menuitemcheckbox" aria-checked={showPreview} onclick={() => runMenuCommand('togglePreview')}>
+                分屏预览 <span class="float-right text-[var(--text-tertiary)]">{shortcut('togglePreview')}</span>
               </button>
               <div class="border-t border-[var(--border-color)]"></div>
-              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center" onclick={() => { setEditorMode('wysiwym'); closeAllMenus(); }}>
-                <span class="mr-2">{$editorMode === 'wysiwym' ? '●' : '○'}</span>
-                Write
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center" disabled={!$activeSessionId}
+                role="menuitemradio" aria-label="写作" aria-checked={$editorMode === 'wysiwym'} onclick={() => selectMode('wysiwym')}>
+                写作
               </button>
-              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center" onclick={() => { setEditorMode('source'); closeAllMenus(); }}>
-                <span class="mr-2">{$editorMode === 'source' ? '●' : '○'}</span>
-                Source
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center" disabled={!$activeSessionId}
+                role="menuitemradio" aria-label="源码" aria-checked={$editorMode === 'source'} onclick={() => selectMode('source')}>
+                源码
               </button>
-              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center" onclick={() => { setEditorMode('preview'); closeAllMenus(); }}>
-                <span class="mr-2">{$editorMode === 'preview' ? '●' : '○'}</span>
-                Read
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center" disabled={!$activeSessionId}
+                role="menuitemradio" aria-label="阅读" aria-checked={$editorMode === 'preview'} onclick={() => selectMode('preview')}>
+                阅读
               </button>
               <div class="border-t border-[var(--border-color)]"></div>
-              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center" onclick={() => { typewriterMode.update(v => !v); closeAllMenus(); }}>
-                <span class="mr-2">{$typewriterMode ? '☑' : '☐'}</span>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center"
+                role="menuitemcheckbox" aria-label="打字机模式" aria-checked={$typewriterMode} onclick={() => runMenuCommand('typewriterMode')}>
                 打字机模式
               </button>
-              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center" onclick={() => { focusMode.update(v => !v); closeAllMenus(); }}>
-                <span class="mr-2">{$focusMode ? '☑' : '☐'}</span>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] flex items-center"
+                role="menuitemcheckbox" aria-label="专注模式" aria-checked={$focusMode} onclick={() => runMenuCommand('focusMode')}>
                 专注模式
               </button>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => runMenuCommand('zoomIn')}>放大显示</button>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => runMenuCommand('zoomOut')}>缩小显示</button>
+              <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => runMenuCommand('zoomReset')}>恢复 100% 显示</button>
               <div class="border-t border-[var(--border-color)]"></div>
               <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => runMenuCommand('toggleTheme')}>
                 {$theme === 'light' ? '暗色主题' : '亮色主题'}
@@ -898,14 +763,16 @@
                     onmouseenter={() => showThemeSubmenu = true}
                     onmouseleave={() => showThemeSubmenu = false}
                     role="menu"
+                    use:anchoredMenu={true}
                     tabindex="-1"
                   >
                     {#each THEME_PRESETS as preset}
-                      <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm flex items-center gap-2"
+                      <button class="theme-menu-item w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)] text-sm"
+                        role="menuitemradio" aria-checked={$themePreset === preset.id}
                         onclick={() => { setThemePreset(preset.id); closeAllMenus(); }}
                       >
-                        {preset.name}
-                        <span class="text-xs text-[var(--text-tertiary)]">{preset.description}</span>
+                        <span>{preset.name}</span>
+                        <span class="theme-menu-description">{preset.description}</span>
                       </button>
                     {/each}
                   </div>
@@ -934,6 +801,7 @@
               onmouseenter={cancelClose}
               onmouseleave={scheduleClose}
               role="menu"
+              use:anchoredMenu
               tabindex="-1"
             >
               <button class="w-full px-4 py-2 text-left hover:bg-[var(--bg-secondary)]" onclick={() => runMenuCommand('settings')}>
@@ -956,14 +824,17 @@
     </div>
 
     <div class="menubar-center">
-      <span class="menubar-filename">
+      {#if $activeSessionId && $sessions.length < 2 && !$settings.showSingleTab}
+      <span class="menubar-filename" title={$currentFile || $fileName || '未命名'}>
         {$fileName || $currentFile || '未命名'}
       </span>
       {#if $isDirty}
         <span class="menubar-dirty">●</span>
       {/if}
+      {/if}
       {#if exportInProgress}
-        <span role="status" class="text-xs text-[var(--text-secondary)]">正在准备导出…</span>
+        <span role="status" class="text-xs text-[var(--text-secondary)]">{$exportJob?.label} · {$exportJob ? exportStages[$exportJob.stage] : ''}</span>
+        {#if $exportJob?.cancellable}<button type="button" class="menu-button" onclick={cancelExport}>取消导出</button>{/if}
       {/if}
     </div>
 
@@ -1040,24 +911,32 @@
 </div>
 
 <!-- 关于对话框 -->
+{#if previewSource}
+  <ExportPreview source={previewSource} initialPreferences={previewPreferences} close={closeExportPreview} confirm={confirmExportPreview} />
+{/if}
+
 {#if showAboutDialog}
   <div class="fixed inset-0 bg-black/50 flex items-center justify-center z-[200]" onclick={() => showAboutDialog = false} role="button" tabindex="-1" onkeydown={(e) => e.key === 'Escape' && (showAboutDialog = false)}>
-    <div class="bg-[var(--bg-primary)] rounded-lg shadow-xl p-6 w-80 border border-[var(--border-color)]" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="关于 Reader" tabindex="-1" onkeydown={(e) => {}}>
+    <div class="about-panel" use:dialogFocus={{ close: () => showAboutDialog = false }} onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="关于 Reader" tabindex="-1" onkeydown={(e) => {}}>
       <div class="text-center mb-4">
-        <div class="text-4xl mb-2">📖</div>
         <h2 class="text-xl font-semibold text-[var(--text-primary)]">Reader</h2>
         <p class="text-sm text-[var(--text-secondary)]">轻量级 Markdown / LaTeX 阅读器</p>
       </div>
       <div class="text-sm text-[var(--text-secondary)] space-y-1 mb-4">
-        <p>版本：1.0.0</p>
+        <p>版本：{buildInfo.version}</p>
+        <p>构建：{buildTimeLabel()}（北京时间）</p>
+        <p>源码：{buildInfo.revision}{buildInfo.dirty ? ' · 含未提交修改' : ''}</p>
+        <p>环境：{diagnostics.platform}</p>
+        <p class="program-path">程序：{diagnostics.executable}</p>
         <p>基于 Tauri v2 + SvelteKit</p>
         <p>支持 Markdown、LaTeX、Mermaid、代码高亮</p>
       </div>
       <div class="border-t border-[var(--border-color)] pt-3">
         <p class="text-xs text-[var(--text-tertiary)] text-center">
-          © 2025 Shaoyilei · MIT License
+          © {new Date().getFullYear()} Shaoyilei · MIT License
         </p>
       </div>
+      <button class="diagnostic-copy" onclick={copyDiagnostics}>复制诊断信息</button>
       <button
         class="w-full mt-4 px-4 py-2 bg-[var(--accent-color)] text-white rounded-md hover:bg-[var(--accent-hover)] transition-colors"
         onclick={() => showAboutDialog = false}
@@ -1067,3 +946,43 @@
     </div>
   </div>
 {/if}
+
+<style>
+  .menu-group :global([role="menu"]) {
+    width: 260px;
+    min-width: min(220px, calc(100vw - 16px));
+    padding: 5px;
+    overflow: auto;
+    background: var(--ui-panel);
+    color: var(--ui-text);
+    border: 1px solid var(--ui-border);
+    border-radius: 6px;
+    box-shadow: var(--ui-shadow-popover);
+    animation: none;
+  }
+  .menu-group :global([role="menu"] button) {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    min-height: 30px;
+    padding: 6px 10px 6px 24px;
+    border-radius: 3px;
+    font-size: 13px;
+    line-height: 1.4;
+  }
+  .menu-group :global([role="menu"] button:hover:not(:disabled)),
+  .menu-group :global([role="menu"] button:focus-visible) { background: var(--ui-panel-hover); outline: none; }
+  .menu-group :global([role="menu"] button:disabled) { opacity: .4; cursor: default; }
+  .menu-group :global([role="menu"] button[aria-checked="true"]::before) {
+    content: '\2713'; position: absolute; left: 7px; top: 50%; transform: translateY(-50%); font-size: 12px;
+  }
+  .menu-group :global([role="menu"] .float-right) { flex-shrink: 0; font-size: 11px; color: var(--ui-text-muted); }
+  .menu-group :global([role="menu"] .border-t) { margin: 5px 6px; border-color: var(--ui-border); }
+  .menu-group :global([role="menu"] .theme-menu-item) { display: block; }
+  .theme-menu-description { display: block; margin-top: 2px; color: var(--ui-text-muted); font-size: 11px; white-space: normal; }
+  .about-panel { width: min(480px, calc(100vw - 32px)); max-height: 85vh; overflow: auto; padding: 24px; background: var(--ui-panel-active); color: var(--ui-text); border: 1px solid var(--ui-border); border-radius: 6px; box-shadow: var(--ui-shadow-popover); }
+  .program-path { overflow-wrap: anywhere; font-size: 12px; }
+  .diagnostic-copy { width: 100%; padding: 7px 12px; margin-top: 12px; border: 1px solid var(--ui-border); border-radius: 4px; background: var(--ui-panel); font-size: 13px; }
+</style>

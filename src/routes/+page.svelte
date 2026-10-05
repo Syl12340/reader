@@ -1,9 +1,13 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { dialogFocus } from '$lib/utils/dialog-focus';
+  import { onMount, tick } from 'svelte';
   import { get } from 'svelte/store';
   import { theme, toggleTheme } from '$lib/stores/theme';
   import { initThemePreset } from '$lib/themes';
-  import { currentFile, fileContent, isEditing } from '$lib/stores/document';
+  import { currentFile, fileContent, isEditing, cycleSession } from '$lib/stores/document';
+  import QuickOpen from '$lib/components/QuickOpen.svelte';
+  import { WorkspaceSessionService } from '$lib/services/workspace-session';
+  import { NavigationService } from '$lib/services/navigation';
   import { setCurrentFileDir } from '$lib/utils/markdown';
   import { isTauri } from '$lib/utils/platform';
   import { pathContains, normalizePathKey, replacePathPrefix } from '$lib/utils/path';
@@ -12,12 +16,13 @@
   import { currentDirectory, refreshDirectory } from '$lib/stores/file';
   import { readFile as readNativeFile, watchPaths, unwatchDirectory, onFsChange, type WatchPath } from '$lib/utils/native-fs';
   import { DocumentService, closeConfirmDialog } from '$lib/services/document';
-  import { settings } from '$lib/stores/settings';
+  import { settings, updateSettings } from '$lib/stores/settings';
   import { ShortcutService } from '$lib/services/shortcut';
   import { RecoveryService } from '$lib/services/recovery';
   import { RenderService } from '$lib/services/render';
   import { CommandService } from '$lib/services/command';
-  import { editorMode, splitPreviewVisible, toggleReadMode, toggleSplitPreview } from '$lib/stores/ui';
+  import { editorMode, splitPreviewVisible, toggleReadMode, toggleSplitPreview, focusMode, typewriterMode } from '$lib/stores/ui';
+  import { selectDocumentMode } from '$lib/services/editor-presentation';
   import Toolbar from '$lib/components/Toolbar.svelte';
   import TabBar from '$lib/components/TabBar.svelte';
   import Sidebar from '$lib/components/Sidebar.svelte';
@@ -25,20 +30,32 @@
   import Preview from '$lib/components/Preview.svelte';
   import StatusBar from '$lib/components/StatusBar.svelte';
   import SearchReplace from '$lib/components/SearchReplace.svelte';
-  import Breadcrumb from '$lib/components/Breadcrumb.svelte';
+  import { WorkspaceService } from '$lib/services/workspace';
   import SettingsComponent from '$lib/components/Settings.svelte';
   import CommandPalette from '$lib/components/CommandPalette.svelte';
   import RecoveryCenter from '$lib/components/RecoveryCenter.svelte';
+  import InteractionHost from '$lib/components/InteractionHost.svelte';
+  import ResourceInspector from '$lib/components/ResourceInspector.svelte';
+  import { TYPOGRAPHY_PRESETS } from '$lib/styles/typography';
+  import { WorkspaceIndex } from '$lib/services/workspace-index';
   import '../app.css';
 
   let showSidebar = $state(false);
+  let sidebarTab = $state<'files' | 'outline' | 'search'>('files');
+  const typography = $derived(TYPOGRAPHY_PRESETS[$settings.typographyPreset]);
   let showSearchReplace = $state(false);
   let showSettings = $state(false);
   let showCommandPalette = $state(false);
   let showRecoveryCenter = $state(false);
+  let showQuickOpen = $state(false);
+  let workspaceCleanup = () => {};
   const paletteCommands = $derived([
     { id: 'newFile', label: '新建文档' },
     { id: 'openFile', label: '打开文件' },
+    { id: 'quickOpen', label: '快速打开文件' },
+    { id: 'reopenTab', label: '重新打开关闭的标签' },
+    { id: 'navigateBack', label: '返回上一位置' },
+    { id: 'navigateForward', label: '前往下一位置' },
     { id: 'recoveryCenter', label: '恢复中心：草稿与替换前版本' },
     { id: 'saveFile', label: '保存文档', disabled: !$activeSessionId },
     { id: 'saveAs', label: '另存为', disabled: !$activeSessionId },
@@ -50,11 +67,21 @@
     { id: 'toggleRead', label: '切换阅读模式', disabled: !$activeSessionId },
     { id: 'toggleTheme', label: '切换明暗主题' },
     { id: 'fullscreen', label: '切换全屏' },
+    { id: 'focusMode', label: '专注模式' },
+    { id: 'typewriterMode', label: '打字机模式' },
+    { id: 'zoomIn', label: '放大显示' },
+    { id: 'zoomOut', label: '缩小显示' },
+    { id: 'zoomReset', label: '恢复 100% 显示' },
+    { id: 'exportPdf', label: '导出 PDF', disabled: !$activeSessionId },
+    { id: 'exportDefault', label: '快速导出', disabled: !$activeSessionId },
+    { id: 'exportPrevious', label: '使用上次配置导出', disabled: !$activeSessionId },
+    { id: 'exportPreview', label: '导出预览与设置', disabled: !$activeSessionId },
   ]);
   let searchMode = $state<'search' | 'replace'>('search');
 
   let splitRatio = $state(0.5);
   let isSplitResizing = $state(false);
+  let stopSplitResize = () => {};
   let splitContainer: HTMLElement | null = $state(null);
   const MIN_SPLIT_RATIO = 0.2;
   const MAX_SPLIT_RATIO = 0.8;
@@ -141,6 +168,7 @@
 
         // 没有未保存内容：不拦截，让原生窗口关闭流程继续执行。
         if (!dirty && !DocumentService.hasPendingOperations()) {
+          WorkspaceSessionService.flush();
           if (unlisten) unlisten();
           return;
         }
@@ -149,14 +177,19 @@
         event.preventDefault();
 
         closeInProgress = true;
+        WorkspaceSessionService.pauseForClose();
+        let destroyed = false;
         try {
           const closedAll = await DocumentService.closeAllSessionsWithPrompt();
           if (closedAll && get(sessions).length === 0) {
+            WorkspaceSessionService.flush();
             await appWindow.destroy();
+            destroyed = true;
             unlisten();
           }
         } finally {
           closeInProgress = false;
+          WorkspaceSessionService.resume(destroyed);
         }
       });
 
@@ -202,6 +235,7 @@
           pathsAffectCurrentDirectory(paths) ? refreshDirectory() : Promise.resolve(),
           paths.length > 0 ? syncExternallyChangedFiles(paths) : Promise.resolve(),
         ]);
+        if (pathsAffectCurrentDirectory(paths)) WorkspaceIndex.invalidate();
       } while (pendingFsPaths.size > 0 && !fsSyncDisposed);
     } finally {
       fsSyncInFlight = false;
@@ -363,28 +397,56 @@
     localStorage.setItem('recentFiles', JSON.stringify(recentFiles));
   }
 
-  function startSplitResize(event: MouseEvent) {
-    if (!splitContainer) return;
+  function persistSplitRatio() {
+    try { localStorage.setItem('splitRatio', String(splitRatio)); }
+    catch (error) { console.warn('Could not persist split ratio:', error); }
+  }
+
+  function adjustSplit(event: KeyboardEvent) {
+    if (event.defaultPrevented || event.isComposing) return;
+    const delta = event.shiftKey ? 0.1 : 0.025;
+    const next = event.key === 'ArrowLeft' || event.key === 'ArrowDown' ? splitRatio - delta
+      : event.key === 'ArrowRight' || event.key === 'ArrowUp' ? splitRatio + delta
+      : event.key === 'Home' ? MIN_SPLIT_RATIO : event.key === 'End' ? MAX_SPLIT_RATIO : event.key === 'Enter' ? 0.5 : null;
+    if (next === null) return;
+    event.preventDefault(); event.stopPropagation();
+    splitRatio = Math.min(MAX_SPLIT_RATIO, Math.max(MIN_SPLIT_RATIO, next)); persistSplitRatio();
+  }
+
+  function startSplitResize(event: PointerEvent) {
+    if (!splitContainer || event.button !== 0) return;
+    event.preventDefault(); stopSplitResize();
+    if (event.currentTarget instanceof HTMLElement) event.currentTarget.focus({ preventScroll: true });
     isSplitResizing = true;
     const rect = splitContainer.getBoundingClientRect();
     const startX = event.clientX;
     const startRatio = splitRatio;
+    const pointerId = event.pointerId;
+    if (!rect.width) { isSplitResizing = false; return; }
 
-    function onMouseMove(e: MouseEvent) {
+    function onMouseMove(e: PointerEvent) {
+      if (e.pointerId !== pointerId) return;
       const delta = e.clientX - startX;
       const next = (startRatio * rect.width + delta) / rect.width;
       splitRatio = Math.max(MIN_SPLIT_RATIO, Math.min(MAX_SPLIT_RATIO, next));
     }
 
-    function onMouseUp() {
+    function onMouseUp(event?: Event) {
+      if (event instanceof PointerEvent && event.pointerId !== pointerId) return;
       isSplitResizing = false;
-      localStorage.setItem('splitRatio', String(splitRatio));
-      document.removeEventListener('mousemove', onMouseMove);
-      document.removeEventListener('mouseup', onMouseUp);
+      persistSplitRatio();
+      window.removeEventListener('pointermove', onMouseMove);
+      window.removeEventListener('pointerup', onMouseUp);
+      window.removeEventListener('pointercancel', onMouseUp);
+      window.removeEventListener('blur', onMouseUp);
+      stopSplitResize = () => {};
     }
 
-    document.addEventListener('mousemove', onMouseMove);
-    document.addEventListener('mouseup', onMouseUp);
+    stopSplitResize = onMouseUp;
+    window.addEventListener('pointermove', onMouseMove);
+    window.addEventListener('pointerup', onMouseUp);
+    window.addEventListener('pointercancel', onMouseUp);
+    window.addEventListener('blur', onMouseUp);
   }
 
   // 初始化
@@ -436,6 +498,9 @@
 
     const initialFile = new URL(window.location.href).searchParams.get('file');
     if (initialFile) void DocumentService.openPath(initialFile);
+    void WorkspaceSessionService.start(!!initialFile).then(cleanup => {
+      if (fsSyncDisposed) cleanup(); else workspaceCleanup = cleanup;
+    }).catch(error => console.warn('Workspace startup failed:', error));
 
     // 未保存检测（浏览器 beforeunload）
     if (!isTauri()) {
@@ -496,12 +561,27 @@
     // 注册快捷键服务回调
     const commandCleanups: Array<() => void> = [];
     const registerCommand = (id: string, handler: () => void | Promise<void>) => {
-      commandCleanups.push(CommandService.register(id, handler));
+      const needsDocument = ['saveFile', 'saveAs', 'print', 'find', 'replace', 'togglePreview', 'toggleRead', 'closeTab'];
+      commandCleanups.push(CommandService.register(id, handler, {
+        label: paletteCommands.find(command => command.id === id)?.label,
+        enabled: () => !needsDocument.includes(id) || !!get(activeSessionId),
+        checked: id === 'toggleSidebar' ? () => showSidebar : id === 'togglePreview' ? () => get(splitPreviewVisible)
+          : id === 'toggleRead' ? () => get(editorMode) === 'preview' : id === 'focusMode' ? () => get(focusMode)
+          : id === 'typewriterMode' ? () => get(typewriterMode) : undefined,
+        unavailable: '请先打开或新建文档。',
+      }));
       commandCleanups.push(ShortcutService.register(id, () => CommandService.execute(id)));
     };
     registerCommand('newFile', () => {
       DocumentService.createNewSession('未命名.md');
     });
+    registerCommand('quickOpen', () => { showQuickOpen = true; });
+    registerCommand('nextTab', () => cycleSession(1));
+    registerCommand('previousTab', () => cycleSession(-1));
+    registerCommand('reopenTab', () => DocumentService.reopenClosedSession());
+    registerCommand('closeTab', async () => { const id = get(activeSessionId); if (id) await DocumentService.closeSessionWithPrompt(id); });
+    registerCommand('navigateBack', () => NavigationService.travel('back'));
+    registerCommand('navigateForward', () => NavigationService.travel('forward'));
     registerCommand('openFile', async () => {
       const id = await DocumentService.openFile();
       if (id) {
@@ -525,9 +605,18 @@
         if (saved && s && s.path) addRecentFile(s.path);
       }
     });
-    registerCommand('toggleSidebar', () => {
-      showSidebar = !showSidebar;
-    });
+    registerCommand('toggleSidebar', toggleSidebar);
+    registerCommand('openFolder', async () => { await WorkspaceService.openFolder(); });
+    registerCommand('focusMode', () => focusMode.update(value => !value));
+    registerCommand('typewriterMode', () => typewriterMode.update(value => !value));
+    for (const [id, mode] of [['modeWrite', 'wysiwym'], ['modeSource', 'source'], ['modeRead', 'preview']] as const) {
+      commandCleanups.push(CommandService.register(id, () => selectDocumentMode(mode), {
+        enabled: () => !!get(activeSessionId), checked: () => get(editorMode) === mode,
+      }));
+    }
+    registerCommand('zoomIn', () => updateSettings({ displayZoom: get(settings).displayZoom + 10 }));
+    registerCommand('zoomOut', () => updateSettings({ displayZoom: get(settings).displayZoom - 10 }));
+    registerCommand('zoomReset', () => updateSettings({ displayZoom: 100 }));
     registerCommand('togglePreview', () => {
       toggleSplitPreview();
     });
@@ -588,6 +677,8 @@
     }
 
     return () => {
+      WorkspaceSessionService.dispose();
+      workspaceCleanup();
       commandCleanups.forEach(cleanup => cleanup());
       if (recoveryTimer) clearTimeout(recoveryTimer);
       window.removeEventListener('focus', syncOnFocus);
@@ -598,6 +689,7 @@
         window.removeEventListener('beforeunload', handleBeforeUnload);
       }
       stopAutoSave();
+      stopSplitResize();
       unsubscribeAutoSave();
       unsubscribeDirectory();
       unsubscribeWatcherSessions();
@@ -629,7 +721,9 @@
 
   // 切换侧边栏
   function toggleSidebar() {
+    const restore = showSidebar && document.activeElement instanceof Element && !!document.activeElement.closest('.sidebar-drawer');
     showSidebar = !showSidebar;
+    if (restore) void tick().then(() => document.querySelector<HTMLButtonElement>('[aria-label="显示侧栏"]')?.focus());
   }
 
   // 切换预览
@@ -672,7 +766,8 @@
 
 <div
   class="app-shell"
-  style="--reader-font-size: {$settings.fontSize}px; --reader-line-height: {$settings.lineHeight};"
+  data-typography={$settings.typographyPreset}
+  style="--reader-font-size: {$settings.fontSize * $settings.displayZoom / 100}px; --reader-line-height: {$settings.lineHeight}; --font-content: {$settings.customFontContent || typography.font}; --doc-content-width: {$settings.contentWidth * $settings.displayZoom / 100}px; --doc-h1-size: {typography.h1}em; --doc-h2-size: {typography.h2}em; --doc-paragraph-gap: {typography.paragraphGap}em;"
 >
   <!-- 工具栏 -->
   <Toolbar
@@ -686,31 +781,30 @@
     onToggleAutoSave={toggleAutoSave}
     onOpenSettings={() => showSettings = true}
   />
-
-  <!-- 标签页栏 -->
-  <TabBar />
-
-
+  <QuickOpen bind:visible={showQuickOpen} {recentFiles} />
 
   <!-- 主内容区 -->
   <div class="workspace-stage">
     <!-- 侧边栏抽屉 -->
     {#if showSidebar}
+      <button class="sidebar-scrim" type="button" aria-label="关闭侧栏遮罩" tabindex="-1" onclick={toggleSidebar}></button>
       <aside
         class="sidebar-drawer sidebar-dock"
         style="--drawer-width: {sidebarWidth}px"
-        aria-label="Files sidebar"
+        aria-label="文档侧栏"
       >
-				<button type="button" class="sidebar-close-button" onclick={toggleSidebar} aria-label="Hide library sidebar">
-          Hide
+				<button type="button" class="sidebar-close-button" onclick={toggleSidebar} aria-label="隐藏侧栏">
+          ×
         </button>
         <div class="sidebar-drawer-body">
-          <Sidebar />
+          <Sidebar bind:activeTab={sidebarTab} />
         </div>
       </aside>
     {/if}
 
     <!-- 编辑区 -->
+    <div class="document-workspace">
+    <TabBar />
     <main class="editor-stage" bind:this={splitContainer}>
       <!-- 搜索替换面板 -->
       <SearchReplace bind:visible={showSearchReplace} mode={searchMode} />
@@ -722,21 +816,28 @@
           aria-hidden={$editorMode === 'preview'}
           style="flex: 0 0 {editorBasis};"
         >
-          <Breadcrumb />
           <Editor />
         </div>
       {/if}
 
       {#if $isEditing && $splitPreviewVisible && $editorMode !== 'preview'}
-        <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-        <div
+        <input
+          type="range"
           class="split-handle"
           class:active={isSplitResizing}
-          onmousedown={startSplitResize}
-          role="separator"
-          aria-orientation="vertical"
+          onpointerdown={startSplitResize}
+          onkeydown={adjustSplit}
+          oninput={event => { splitRatio = event.currentTarget.valueAsNumber / 100; persistSplitRatio(); }}
+          ondblclick={() => { splitRatio = 0.5; persistSplitRatio(); }}
+          min={MIN_SPLIT_RATIO * 100}
+          max={MAX_SPLIT_RATIO * 100}
+          value={splitRatio * 100}
+          step="any"
+          aria-valuetext={`编辑 ${Math.round(splitRatio * 100)}%，预览 ${Math.round((1 - splitRatio) * 100)}%`}
+          aria-orientation="horizontal"
           aria-label="调整编辑与预览比例"
-        ></div>
+          title="拖动或用方向键调整分屏，Enter 或双击居中"
+        />
       {/if}
 
       {#if $splitPreviewVisible || $editorMode === 'preview'}
@@ -745,10 +846,23 @@
           class:read-mode={$editorMode === 'preview'}
           style="flex: 1 1 {previewBasis};"
         >
-          <Preview content={renderedContent} />
+          <Preview content={renderedContent} showFloatingOutline={!showSidebar || sidebarTab !== 'outline'} />
         </div>
       {/if}
+      {#if !$isEditing}
+        <section class="welcome-page" aria-label="开始写作">
+          <h1>Reader</h1>
+          <p>专注内容，从一页空白开始。</p>
+          <div class="welcome-actions">
+            <button onclick={() => CommandService.execute('newFile')}>新建文档 <kbd>Ctrl N</kbd></button>
+            <button onclick={() => CommandService.execute('openFile')}>打开文件 <kbd>Ctrl O</kbd></button>
+            <button onclick={() => WorkspaceService.openFolder()}>打开文件夹</button>
+            <button onclick={() => CommandService.execute('quickOpen')}>快速打开 <kbd>Ctrl Shift O</kbd></button>
+          </div>
+        </section>
+      {/if}
     </main>
+    </div>
   </div>
 
   <!-- 状态栏 -->
@@ -759,11 +873,14 @@
 <SettingsComponent bind:visible={showSettings} />
 <RecoveryCenter bind:visible={showRecoveryCenter} />
 <CommandPalette bind:visible={showCommandPalette} commands={paletteCommands} />
+<InteractionHost />
+<ResourceInspector />
 
 <!-- 未保存更改确认框 -->
 {#if $closeConfirmDialog}
   <div class="fixed inset-0 bg-black/50 flex items-center justify-center z-[250]" onclick={() => $closeConfirmDialog?.onResolve('cancel')} role="button" tabindex="-1" onkeydown={(e) => e.key === 'Escape' && ($closeConfirmDialog?.onResolve('cancel'))}>
-    <div class="bg-[var(--bg-primary)] rounded-lg shadow-xl p-6 w-96 border border-[var(--border-color)]" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="未保存变更" tabindex="-1" onkeydown={(e) => {}}>
+    <div class="save-confirm-dialog" use:dialogFocus={{ close: () => $closeConfirmDialog?.onResolve('cancel') }}
+      onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="未保存变更" tabindex="-1" onkeydown={(e) => {}}>
       <h3 class="text-lg font-semibold text-[var(--text-primary)] mb-2">未保存的变更</h3>
       <p class="text-sm text-[var(--text-secondary)] mb-4">
         文件 "{$closeConfirmDialog.fileName}" 已被修改，是否保存？
@@ -776,7 +893,7 @@
           取消
         </button>
         <button
-          class="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-md transition-colors"
+          class="px-4 py-2 bg-[var(--bg-secondary)] hover:bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded-md transition-colors"
           onclick={() => $closeConfirmDialog?.onResolve('dontsave')}
         >
           不保存
@@ -793,6 +910,7 @@
 {/if}
 
 <style>
+  .save-confirm-dialog { width: min(420px, calc(100vw - 32px)); padding: 24px; background: var(--ui-panel-active); color: var(--ui-text); border: 1px solid var(--ui-border); border-radius: 6px; box-shadow: var(--ui-shadow-popover); }
   .app-shell {
     display: flex;
     flex-direction: column;
@@ -809,6 +927,15 @@
     overflow: hidden;
     background: var(--doc-bg);
   }
+  .document-workspace { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
+  .sidebar-scrim { display: none; }
+  .welcome-page { width: min(460px, 80%); margin: auto; padding-bottom: 8vh; }
+  .welcome-page h1 { font-size: 34px; font-weight: 600; color: var(--doc-text); letter-spacing: -1px; }
+  .welcome-page p { margin: 10px 0 28px; color: var(--ui-text-muted); }
+  .welcome-actions { display: grid; gap: 4px; }
+  .welcome-actions button { text-align: left; display: flex; justify-content: space-between; border: 0; background: transparent; padding: 10px 12px; border-radius: 3px; cursor: pointer; }
+  .welcome-actions button:hover { background: var(--ui-panel-hover); }
+  .welcome-actions kbd { color: var(--ui-text-muted); font-size: 12px; }
 
   .editor-stage {
     position: relative;
@@ -838,13 +965,14 @@
     z-index: 2;
     right: 8px;
     top: 6px;
-    height: 22px;
+    height: 28px;
+    width: 28px;
     border: 0;
     border-radius: 4px;
     padding: 0 6px;
     background: transparent;
     color: var(--ui-text-muted);
-    font-size: 10px;
+    font-size: 20px;
     cursor: pointer;
     opacity: 0.52;
   }
@@ -866,14 +994,27 @@
   }
 
   .split-handle {
-    width: 3px;
+    appearance: none;
+    width: 6px;
+    min-width: 6px;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    align-self: stretch;
     cursor: col-resize;
+    touch-action: none;
     background: transparent;
     transition: background 0.12s;
     flex-shrink: 0;
   }
 
+  .split-handle::-webkit-slider-thumb { appearance: none; width: 0; height: 0; }
+  .split-handle::-moz-range-thumb { width: 0; height: 0; border: 0; }
+  .split-handle::-moz-range-track { background: transparent; }
+
   .split-handle:hover,
+  .split-handle:focus-visible,
   .split-handle.active {
     background: color-mix(in srgb, var(--ui-border) 72%, var(--ui-panel-hover));
   }
@@ -906,5 +1047,9 @@
   .preview-pane.read-mode {
     border-left: 0;
     background: var(--doc-bg);
+  }
+  @media (max-width: 760px) {
+    .sidebar-drawer { position: absolute; inset: 0 auto 0 0; z-index: 32; width: min(276px, calc(100vw - 48px)); min-width: 0; max-width: none; box-shadow: 4px 0 18px #0002; }
+    .sidebar-scrim { display: block; position: absolute; inset: 0; z-index: 31; border: 0; background: #0003; cursor: default; }
   }
 </style>

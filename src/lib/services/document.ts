@@ -7,11 +7,16 @@ import {
   refreshSessionFromDisk,
   markSessionExternalModified,
   markSessionsMissingUnderPath,
+  takeClosedSession,
 } from '$lib/stores/document';
 import { saveFile as fsSaveFile, openFile as fsOpenFile, readFile as fsReadFile, type SaveTarget } from '$lib/utils/native-fs';
 import { RecoveryService, type RecoverySnapshot } from './recovery';
 import { normalizePathKey, pathContains } from '$lib/utils/path';
 import { asFileError } from '$lib/utils/file-error';
+import { isTauri } from '$lib/utils/platform';
+import { currentDirectoryHandle } from '$lib/stores/file';
+import { ask, confirmAction, notify } from './interaction';
+import { changePreview } from '$lib/utils/change-preview';
 
 export interface ConfirmCloseOptions {
   fileName: string;
@@ -46,7 +51,7 @@ export class DocumentService {
       const action = permanent ? '永久删除（不可撤销）' : '移入系统回收站';
       const scope = isDirectory ? '文件夹及其全部内容' : '文件';
       const warning = `将${scope} ${path} ${action}？\n\n影响 ${open.length} 个已打开标签，其中 ${dirty.length} 个有未保存修改。\n标签内容会保留，删除后可另存为。`;
-      if (!confirm(warning)) return false;
+      if (!await confirmAction('删除文件', warning, action)) return false;
       for (const session of affected().filter(s => s.isDirty)) {
         if (!RecoveryService.saveSnapshot(session)) throw new Error('无法备份未保存内容，已取消删除。');
       }
@@ -118,6 +123,19 @@ export class DocumentService {
     return createSession(name, null, '');
   }
 
+  static async reopenClosedSession(): Promise<void> {
+    const previous = takeClosedSession();
+    if (!previous) return;
+    try {
+      const content = await fsReadFile(previous.fileHandle || previous.path!);
+      const id = createSession(previous.name, previous.path, content, content, previous.fileHandle);
+      sessions.update(list => list.map(session => session.id === id ? { ...session,
+        workspaceLayout: previous.workspaceLayout, lastEditingLayout: previous.lastEditingLayout,
+        cursorOffset: Math.min(previous.cursorOffset, content.length), scrollTop: previous.scrollTop,
+        previewScrollTop: previous.previewScrollTop } : session));
+    } catch (error) { notify(`无法重新打开标签：${error instanceof Error ? error.message : String(error)}`); }
+  }
+
   static restoreSnapshotAsCopy(snapshot: RecoverySnapshot): string {
     const name = snapshot.name.replace(/(\.[^.]+)?$/, ' (恢复副本)$1');
     const id = createSession(name, null, snapshot.content, '');
@@ -146,18 +164,37 @@ export class DocumentService {
     if (!session) return false;
     if (this.isDeleting(session.path)) return false;
 
-    if (
-      !saveAs && session.externalModified
-      && !confirm(session.externalReadError
-        ? '当前无法确认磁盘版本。继续保存可能覆盖外部修改，是否继续？'
-        : '磁盘文件已被外部修改。继续保存将覆盖外部版本，是否继续？')
-    ) return false;
+    let overwriteBaseline: string | undefined;
+    if (!saveAs && session.externalModified) {
+      const reviewed = session;
+      let disk: string | undefined;
+      try { disk = await fsReadFile(session.fileHandle || session.path!); }
+      catch (error) { notify(`无法读取磁盘版本：${String(error)}`); }
+      const choice = await ask({ title: '文件发生外部修改', message: `“${session.name}”的磁盘版本与当前文档不同。保留当前不会写盘。`,
+        comparison: disk !== undefined ? changePreview(session.content, disk) : undefined,
+        actions: [{ id: 'cancel', label: '保留当前' }, ...(disk !== undefined ? [{ id: 'reload', label: '载入磁盘' }] : []),
+          { id: 'saveas', label: '另存副本' }, ...(disk !== undefined ? [{ id: 'overwrite', label: '覆盖磁盘', danger: true }] : [])] });
+      const latest = get(sessions).find(s => s.id === id);
+      if (!latest || latest.contentVersion !== reviewed.contentVersion || latest.path !== reviewed.path || latest.fileHandle !== reviewed.fileHandle) {
+        notify('审阅期间文档已变化，请重新处理外部修改。'); return false;
+      }
+      if (choice === 'reload' && disk !== undefined) {
+        // Reload again to avoid presenting a stale disk snapshot as current.
+        return this.performReload(id, true, disk);
+      }
+      if (choice === 'saveas') return this.performSave(id, true);
+      if (choice !== 'overwrite') return false;
+      if (disk !== undefined && !RecoveryService.saveCheckpoint(session.path ?? session.name, disk)) {
+        notify('磁盘版本备份失败，未覆盖文件。'); return false;
+      }
+      overwriteBaseline = disk;
+    }
 
     let reservedTarget: string | null = null;
     const validateTarget = async (target: SaveTarget): Promise<boolean> => {
       const key = target.path ? `path:${normalizePathKey(target.path)}` : `handle:${target.name.toLocaleLowerCase()}`;
       if (this.saveTargets.has(key)) {
-        alert('另一个保存操作正在写入同一目标，请等待完成后重试。');
+        notify('另一个保存操作正在写入同一目标，请等待完成后重试。');
         return false;
       }
       for (const other of get(sessions)) {
@@ -171,26 +208,27 @@ export class DocumentService {
         }
         if (same) {
           activeSessionId.set(other.id);
-          alert(`目标文件已在标签“${other.name}”中打开。为避免产生两个竞争版本，另存为已取消。`);
+          notify(`目标文件已在标签“${other.name}”中打开，另存为已取消。`);
           return false;
         }
       }
-      if (target.existed && !confirm(`目标文件“${target.name}”已存在。确认覆盖当前磁盘版本？`)) return false;
+      if (this.saveTargets.has(key)) { notify('同一目标已被另一个保存操作占用。'); return false; }
       this.saveTargets.add(key);
       reservedTarget = key;
+      if (target.existed && !await confirmAction('覆盖目标文件', `目标文件“${target.name}”已存在。确认覆盖当前磁盘版本？`, '覆盖')) return false;
       return true;
     };
 
     sessions.update(list => list.map(s => s.id === id ? { ...s, saveState: 'saving' as const, saveError: undefined } : s));
     try {
       const handle = saveAs ? undefined : session.fileHandle || session.path || undefined;
-      const expected = !saveAs && handle && !session.externalModified ? session.savedContent : undefined;
-      const result = saveAs
+      const expected = overwriteBaseline ?? (!saveAs && handle ? session.savedContent : undefined);
+      const result = saveAs || !handle
         ? await fsSaveFile(session.name, session.content, handle, expected, validateTarget)
         : await fsSaveFile(session.name, session.content, handle, expected);
       if (!result) return false;
       if (result.downloaded) {
-        alert('已下载文件副本。浏览器无法确认原文件已保存，当前修改仍保留为未保存状态。');
+        notify('已下载文件副本。浏览器无法确认原文件已保存，当前修改仍保留为未保存状态。', undefined, false);
         return false;
       }
       const latest = get(sessions).find(s => s.id === id);
@@ -234,7 +272,7 @@ export class DocumentService {
           markSessionExternalModified(id, undefined, failure.code === 'not_found');
         }
       }
-      alert(`保存文件失败: ${e instanceof Error ? e.message : String(e)}`);
+      notify(`保存文件失败: ${e instanceof Error ? e.message : String(e)}`, { label: '重试', run: () => this.saveSession(id) });
     } finally {
       if (reservedTarget) this.saveTargets.delete(reservedTarget);
       sessions.update(list => list.map(s => s.id === id && s.saveState === 'saving'
@@ -256,19 +294,29 @@ export class DocumentService {
       }
     } catch (e) {
       console.error('Failed to open file:', e);
-      alert(`打开文件失败: ${e instanceof Error ? e.message : String(e)}`);
+      notify(`打开文件失败: ${e instanceof Error ? e.message : String(e)}`, { label: '重试', run: () => this.openFile() });
     }
     return null;
   }
 
-  static async openPath(path: string): Promise<string | null> {
+  static async openPath(path: string, stillCurrent: () => boolean = () => true): Promise<string | null> {
     try {
-      const content = await fsReadFile(path);
+      let reference: string | FileSystemFileHandle = path;
+      if (!isTauri()) {
+        let directory = get(currentDirectoryHandle);
+        const parts = path.replace(/\\/g, '/').split('/').filter(Boolean);
+        if (!directory || parts.some(part => part === '..')) throw new Error('请先授权文件所在的文件夹，浏览器无法读取此本地链接。');
+        for (const part of parts.slice(0, -1)) directory = await directory.getDirectoryHandle(part);
+        reference = await directory.getFileHandle(parts.at(-1)!);
+      }
+      const content = await fsReadFile(reference);
+      if (!stillCurrent()) return null;
       const name = path.split(/[/\\]/).pop() || path;
-      return createSession(name, path, content, content, path);
+      return createSession(name, path, content, content, reference);
     } catch (e) {
+      if (!stillCurrent()) return null;
       console.error('Failed to open path:', e);
-      alert(`打开文件失败: ${e instanceof Error ? e.message : String(e)}`);
+      notify(`打开文件失败: ${e instanceof Error ? e.message : String(e)}`, { label: '重试', run: () => this.openPath(path) });
       return null;
     }
   }
@@ -277,29 +325,53 @@ export class DocumentService {
     return this.enqueue(id, () => this.performReload(id));
   }
 
-  private static async performReload(id: string): Promise<boolean> {
+  private static async performReload(id: string, approved = false, reviewedDisk?: string): Promise<boolean> {
     const session = get(sessions).find(item => item.id === id);
     const reference = session?.fileHandle || session?.path;
     if (!session || !reference) return false;
-    if (session.isDirty && !confirm('重新载入将丢弃当前未保存的修改，是否继续？')) {
+    if (!approved && session.isDirty && !await confirmAction('载入磁盘版本', '重新载入将替换当前未保存的修改，是否继续？', '载入磁盘')) {
       return false;
     }
 
     try {
       const content = await fsReadFile(reference);
+      if (reviewedDisk !== undefined && content !== reviewedDisk) {
+        markSessionExternalModified(id, content); notify('磁盘版本在审阅后再次变化，请重新审阅。'); return false;
+      }
       const latest = get(sessions).find(s => s.id === id);
       if (!latest || latest.path !== session.path || latest.fileHandle !== session.fileHandle) return false;
       if (latest.contentVersion !== session.contentVersion || latest.content !== session.content) {
         markSessionExternalModified(id, content);
         return false;
       }
+      if (session.isDirty && !RecoveryService.saveCheckpoint(session.path ?? session.name, session.content)) {
+        notify('恢复点保存失败，未载入磁盘。'); return false;
+      }
       refreshSessionFromDisk(id, content);
       return true;
     } catch (e) {
       console.error('Failed to reload file:', e);
-      alert(`重新载入失败: ${e instanceof Error ? e.message : String(e)}`);
+      notify(`重新载入失败: ${e instanceof Error ? e.message : String(e)}`, { label: '重试', run: () => this.reloadSessionFromDisk(id) });
       return false;
     }
+  }
+
+  static reviewExternalChange(id: string): Promise<boolean> {
+    return this.enqueue(id, async () => {
+      const session = get(sessions).find(item => item.id === id);
+      if (!session) return false;
+      const disk = await fsReadFile(session.fileHandle || session.path!).catch(error => { notify(String(error)); return undefined; });
+      const choice = await ask({ title: '审阅外部修改', message: `“${session.name}”：保留当前不会清除冲突或覆盖文件。`,
+        comparison: disk !== undefined ? changePreview(session.content, disk) : undefined,
+        actions: [{ id: 'cancel', label: '保留当前' }, ...(disk !== undefined ? [{ id: 'reload', label: '载入磁盘' }] : []), { id: 'saveas', label: '另存副本' }] });
+      const latest = get(sessions).find(item => item.id === id);
+      if (!latest || latest.contentVersion !== session.contentVersion || latest.path !== session.path || latest.fileHandle !== session.fileHandle) {
+        notify('审阅期间文档已变化，请重新审阅。'); return false;
+      }
+      if (choice === 'reload') return this.performReload(id, true, disk);
+      if (choice === 'saveas') return this.performSave(id, true);
+      return false;
+    });
   }
 
   /**

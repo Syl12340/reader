@@ -181,6 +181,8 @@ export interface ExportOptions {
 
 export interface DocumentSession {
   id: string;
+  editorAnchor?: { from: number; offset: number };
+  previewAnchor?: { line: number; offset: number };
   workspaceLayout?: WorkspaceLayout;
   lastEditingLayout?: Exclude<WorkspaceLayout, 'preview'>;
   saveState?: 'saving' | 'error';

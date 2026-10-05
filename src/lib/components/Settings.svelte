@@ -5,27 +5,14 @@
   import { THEME_PRESETS } from '$lib/themes';
   import { settings as settingsStore, updateSettings } from '$lib/stores/settings';
   import { ShortcutService, parseKeyboardEvent } from '$lib/services/shortcut';
+  import { dialogFocus } from '$lib/utils/dialog-focus';
+  import { TYPOGRAPHY_PRESETS, type TypographyPreset } from '$lib/styles/typography';
+  import { notify } from '$lib/services/interaction';
 
   let { visible = $bindable(false) }: {
     visible?: boolean;
   } = $props();
   let settingsPanel = $state<HTMLDivElement>();
-  let restoreFocus: HTMLElement | null = null;
-
-  $effect(() => {
-    if (!visible) return;
-    restoreFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    queueMicrotask(() => {
-      const firstControl = settingsPanel?.querySelector<HTMLElement>(
-        'button, input, select, textarea, [tabindex]:not([tabindex="-1"])',
-      );
-      (firstControl || settingsPanel)?.focus();
-    });
-    return () => {
-      restoreFocus?.focus();
-      restoreFocus = null;
-    };
-  });
 
   // 设置分类
   type SettingsTab = 'general' | 'editor' | 'theme' | 'shortcuts' | 'export';
@@ -38,11 +25,25 @@
     language: 'zh-CN',
     fontSize: 16,
     lineHeight: 1.75,
+    typographyPreset: 'clean' as TypographyPreset,
+    showSingleTab: false,
+    displayZoom: 100,
+    contentWidth: 800,
+    floatingToolbar: 'automatic' as 'automatic' | 'manual' | 'off',
+    imageDirectory: 'assets',
+    exportPaper: 'A4' as 'A4' | 'Letter',
+    exportMargin: 20,
+    exportOutline: false,
+    exportOrientation: 'portrait' as 'portrait' | 'landscape',
+    exportPageNumbers: false,
+    exportBookmarks: false,
+    exportChapterBreaks: false,
     tabSize: 4,
     wordWrap: true,
     showLineNumbers: true,
     bracketMatching: true,
     autoCloseBrackets: true,
+    typewriterOnlyTyping: true,
     currentTheme: 'light',
     currentPreset: 'default',
     customAccentColor: '#3a6ff7',
@@ -61,11 +62,25 @@
       settings.autoSaveInterval = $s.autoSaveInterval;
       settings.fontSize = $s.fontSize;
       settings.lineHeight = $s.lineHeight;
+      settings.typographyPreset = $s.typographyPreset;
+      settings.showSingleTab = $s.showSingleTab;
+      settings.displayZoom = $s.displayZoom;
+      settings.contentWidth = $s.contentWidth;
+      settings.floatingToolbar = $s.floatingToolbar;
+      settings.imageDirectory = $s.imageDirectory;
+      settings.exportPaper = $s.exportPaper;
+      settings.exportMargin = $s.exportMargin;
+      settings.exportOutline = $s.exportOutline;
+      settings.exportOrientation = $s.exportOrientation;
+      settings.exportPageNumbers = $s.exportPageNumbers;
+      settings.exportBookmarks = $s.exportBookmarks;
+      settings.exportChapterBreaks = $s.exportChapterBreaks;
       settings.tabSize = $s.tabSize;
       settings.wordWrap = $s.wordWrap;
       settings.showLineNumbers = $s.showLineNumbers;
       settings.bracketMatching = $s.bracketMatching;
       settings.autoCloseBrackets = $s.autoCloseBrackets;
+      settings.typewriterOnlyTyping = $s.typewriterOnlyTyping;
       settings.customAccentColor = $s.customAccentColor;
       settings.customBgPrimary = $s.customBgPrimary;
       settings.customBgSecondary = $s.customBgSecondary;
@@ -80,13 +95,22 @@
       s.key = ShortcutService.getShortcutKey(s.id);
     });
 
-    return unsubscribe;
+    const unsubscribeTheme = theme.subscribe(value => { settings.currentTheme = value; });
+    const unsubscribePreset = themePreset.subscribe(value => { settings.currentPreset = value; });
+    return () => { unsubscribe(); unsubscribeTheme(); unsubscribePreset(); };
   });
 
   // 快捷键配置
   let shortcuts = $state([
     { id: 'newFile', name: '新建文件', key: '', category: '文件' },
     { id: 'openFile', name: '打开文件', key: '', category: '文件' },
+    { id: 'quickOpen', name: '快速打开', key: '', category: '文件' },
+    { id: 'nextTab', name: '下一个标签', key: '', category: '视图' },
+    { id: 'previousTab', name: '上一个标签', key: '', category: '视图' },
+    { id: 'reopenTab', name: '恢复关闭标签', key: '', category: '文件' },
+    { id: 'closeTab', name: '关闭标签', key: '', category: '文件' },
+    { id: 'navigateBack', name: '导航后退', key: '', category: '视图' },
+    { id: 'navigateForward', name: '导航前进', key: '', category: '视图' },
     { id: 'saveFile', name: '保存文件', key: '', category: '文件' },
     { id: 'saveAs', name: '另存为', key: '', category: '文件' },
     { id: 'exportPdf', name: '导出 PDF', key: '', category: '文件' },
@@ -136,11 +160,25 @@
       autoSaveInterval: settings.autoSaveInterval,
       fontSize: settings.fontSize,
       lineHeight: settings.lineHeight,
+      typographyPreset: settings.typographyPreset,
+      showSingleTab: settings.showSingleTab,
+      displayZoom: settings.displayZoom,
+      contentWidth: settings.contentWidth,
+      floatingToolbar: settings.floatingToolbar,
+      imageDirectory: settings.imageDirectory,
+      exportPaper: settings.exportPaper,
+      exportMargin: settings.exportMargin,
+      exportOutline: settings.exportOutline,
+      exportOrientation: settings.exportOrientation,
+      exportPageNumbers: settings.exportPageNumbers,
+      exportBookmarks: settings.exportBookmarks,
+      exportChapterBreaks: settings.exportChapterBreaks,
       tabSize: settings.tabSize,
       wordWrap: settings.wordWrap,
       showLineNumbers: settings.showLineNumbers,
       bracketMatching: settings.bracketMatching,
       autoCloseBrackets: settings.autoCloseBrackets,
+      typewriterOnlyTyping: settings.typewriterOnlyTyping,
       exportDefaultFormat: settings.exportDefaultFormat,
       exportIncludeCss: settings.exportIncludeCss,
     });
@@ -172,7 +210,7 @@
     const success = ShortcutService.updateShortcutKey(id, newKey);
     if (!success) {
       const conflict = shortcuts.find(s => s.id !== id && s.key === newKey);
-      alert(`快捷键 ${newKey} 已被 "${conflict ? conflict.name : '其他功能'}" 使用`);
+      notify(`快捷键 ${newKey} 已被 "${conflict ? conflict.name : '其他功能'}" 使用`);
       return;
     }
 
@@ -248,33 +286,14 @@
     visible = false;
   }
 
-  function handleKeydown(event: KeyboardEvent) {
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      close();
-      return;
-    }
-    if (event.key !== 'Tab' || !settingsPanel) return;
-
-    const controls = Array.from(settingsPanel.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-    ));
-    if (controls.length === 0) {
-      event.preventDefault();
-      settingsPanel.focus();
-      return;
-    }
-
-    const first = controls[0];
-    const last = controls[controls.length - 1];
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
+  function applyTypography() {
+    const preset = TYPOGRAPHY_PRESETS[settings.typographyPreset];
+    settings.fontSize = preset.size;
+    settings.lineHeight = preset.lineHeight;
+    settings.contentWidth = preset.width;
+    saveSettings();
   }
+
 </script>
 
 {#if visible}
@@ -287,7 +306,7 @@
       aria-modal="true"
       aria-labelledby="settings-title"
       tabindex="-1"
-      onkeydown={handleKeydown}
+      use:dialogFocus={{ close }}
     >
       <!-- 头部 -->
       <div class="settings-header">
@@ -347,13 +366,42 @@
           {:else if activeTab === 'editor'}
             <div class="settings-section">
               <h3>编辑器设置</h3>
+              <div class="setting-item">
+                <div class="setting-info"><span class="setting-label">显示缩放</span><span class="setting-desc">仅缩放文档视图，不改变导出字号；Alt+. 唤起格式工具栏</span></div>
+                <input type="number" class="setting-input" aria-label="显示缩放百分比" bind:value={settings.displayZoom} min="75" max="200" step="10" onchange={saveSettings} />
+              </div>
+              <div class="setting-item">
+                <div class="setting-info"><span class="setting-label">正文版心</span><span class="setting-desc">100% 显示时的正文宽度（像素）</span></div>
+                <input type="number" class="setting-input" aria-label="正文版心宽度" bind:value={settings.contentWidth} min="560" max="1200" step="20" onchange={saveSettings} />
+              </div>
+              <div class="setting-item">
+                <div class="setting-info"><span class="setting-label">选区格式工具栏</span><span class="setting-desc">手动模式使用 Alt+.，避免浮层遮挡选中文字</span></div>
+                <select class="setting-select" aria-label="选区格式工具栏" bind:value={settings.floatingToolbar} onchange={saveSettings}>
+                  <option value="automatic">自动显示</option><option value="manual">仅手动唤起</option><option value="off">关闭</option>
+                </select>
+              </div>
+              <div class="setting-item">
+                <div class="setting-info"><span class="setting-label">图片资源目录</span><span class="setting-desc">文档旁的相对目录，如 assets 或 images；不允许上级目录</span></div>
+                <input class="setting-input" aria-label="图片资源目录" bind:value={settings.imageDirectory} onchange={saveSettings} />
+              </div>
+
+              <div class="setting-item">
+                <div class="setting-info"><span class="setting-label">排版预设</span><span class="setting-desc">统一写作与阅读的字体、版心和标题比例；字号与行高可继续调整</span></div>
+                <select class="setting-select" aria-label="排版预设" bind:value={settings.typographyPreset} onchange={applyTypography}>
+                  {#each Object.entries(TYPOGRAPHY_PRESETS) as [id, preset]}<option value={id}>{preset.label}</option>{/each}
+                </select>
+              </div>
+              <div class="setting-item">
+                <div class="setting-info"><span class="setting-label">单文档也显示标签栏</span><span class="setting-desc">关闭时仅多文档显示标签，减少重复文件名</span></div>
+                <label class="toggle"><input type="checkbox" bind:checked={settings.showSingleTab} onchange={saveSettings} /><span class="toggle-slider"></span></label>
+              </div>
 
               <div class="setting-item">
                 <div class="setting-info">
                   <span class="setting-label">字体大小</span>
-                  <span class="setting-desc">编辑器字体大小（像素）</span>
+                  <span class="setting-desc">写作、源码与阅读字号（像素），不影响菜单和侧栏</span>
                 </div>
-                <input type="number" class="setting-input" bind:value={settings.fontSize} min="10" max="24" onchange={saveSettings} />
+                <input type="number" class="setting-input" aria-label="字体大小" bind:value={settings.fontSize} min="10" max="40" onchange={saveSettings} />
               </div>
 
               <div class="setting-item">
@@ -361,9 +409,16 @@
                   <span class="setting-label">行高</span>
                   <span class="setting-desc">行间距倍数</span>
                 </div>
-                <input type="number" class="setting-input" bind:value={settings.lineHeight} min="1" max="3" step="0.1" onchange={saveSettings} />
+                <input type="number" class="setting-input" aria-label="行高" bind:value={settings.lineHeight} min="1.2" max="3" step="0.1" onchange={saveSettings} />
               </div>
 
+              <div class="setting-item">
+                <div class="setting-info">
+                  <span class="setting-label">打字机模式仅在输入时居中</span>
+                  <span class="setting-desc">关闭后，鼠标选区和导航跳转也会居中</span>
+                </div>
+                <label class="toggle"><input type="checkbox" bind:checked={settings.typewriterOnlyTyping} onchange={saveSettings} /><span class="toggle-slider"></span></label>
+              </div>
               <div class="setting-item">
                 <div class="setting-info">
                   <span class="setting-label">Tab 大小</span>
@@ -503,7 +558,7 @@
                   <span class="setting-desc">自定义内容区域字体</span>
                 </div>
                 <select class="setting-select" bind:value={settings.customFontContent} onchange={applyCustomColors}>
-                  <option value="">默认 (Source Serif 4)</option>
+                  <option value="">跟随排版预设</option>
                   <option value="'Noto Serif SC', serif">思源宋体</option>
                   <option value="'Noto Sans SC', sans-serif">思源黑体</option>
                   <option value="system-ui, sans-serif">系统字体</option>
@@ -562,6 +617,39 @@
           {:else if activeTab === 'export'}
             <div class="settings-section">
               <h3>导出设置</h3>
+              <div class="setting-item">
+                <div class="setting-info"><span class="setting-label">排版预设</span><span class="setting-desc">应用纸张、页边距与 HTML 目录；不改变编辑器排版</span></div>
+                <button type="button" class="setting-select" onclick={() => { settings.exportPaper = 'A4'; settings.exportOrientation = 'portrait'; settings.exportMargin = 20; settings.exportOutline = true; settings.exportPageNumbers = true; settings.exportChapterBreaks = true; settings.exportBookmarks = false; saveSettings(); }}>课程报告</button>
+                <button type="button" class="setting-select" onclick={() => { settings.exportPaper = 'A4'; settings.exportOrientation = 'portrait'; settings.exportMargin = 15; settings.exportOutline = false; settings.exportPageNumbers = false; settings.exportChapterBreaks = false; settings.exportBookmarks = false; saveSettings(); }}>普通文档</button>
+              </div>
+              <div class="setting-item">
+                <div class="setting-info"><span class="setting-label">打印纸张</span><span class="setting-desc">PDF 与浏览器打印使用的纸张</span></div>
+                <select class="setting-select" aria-label="打印纸张" bind:value={settings.exportPaper} onchange={saveSettings}><option>A4</option><option>Letter</option></select>
+              </div>
+              <div class="setting-item">
+                <div class="setting-info"><span class="setting-label">纸张方向</span><span class="setting-desc">横向适合宽表格与图表</span></div>
+                <select class="setting-select" aria-label="导出纸张方向" bind:value={settings.exportOrientation} onchange={saveSettings}><option value="portrait">纵向</option><option value="landscape">横向</option></select>
+              </div>
+              <div class="setting-item">
+                <div class="setting-info"><span class="setting-label">打印页码</span><span class="setting-desc">页底显示当前页 / 总页数，需要 Chromium / WebView2 131+</span></div>
+                <label class="toggle"><input type="checkbox" aria-label="打印页码" bind:checked={settings.exportPageNumbers} onchange={saveSettings} /><span class="toggle-slider"></span></label>
+              </div>
+              <div class="setting-item">
+                <div class="setting-info"><span class="setting-label">PDF 标题书签</span><span class="setting-desc">实验性，仅原生 PDF；不支持的运行时会提示失败</span></div>
+                <label class="toggle"><input type="checkbox" aria-label="PDF 标题书签" bind:checked={settings.exportBookmarks} onchange={saveSettings} /><span class="toggle-slider"></span></label>
+              </div>
+              <div class="setting-item">
+                <div class="setting-info"><span class="setting-label">一级标题另起页</span><span class="setting-desc">仅影响 PDF / 打印，便于章节分隔</span></div>
+                <label class="toggle"><input type="checkbox" aria-label="一级标题另起页" bind:checked={settings.exportChapterBreaks} onchange={saveSettings} /><span class="toggle-slider"></span></label>
+              </div>
+              <div class="setting-item">
+                <div class="setting-info"><span class="setting-label">页边距</span><span class="setting-desc">四边页边距（毫米）</span></div>
+                <input type="number" class="setting-input" aria-label="导出页边距" bind:value={settings.exportMargin} min="10" max="35" onchange={saveSettings} />
+              </div>
+              <div class="setting-item">
+                <div class="setting-info"><span class="setting-label">文档目录</span><span class="setting-desc">HTML / PDF 正文中的可跳转目录，不等同于 PDF 阅读器书签</span></div>
+                <label class="toggle"><input type="checkbox" aria-label="HTML 导出目录" bind:checked={settings.exportOutline} onchange={saveSettings} /><span class="toggle-slider"></span></label>
+              </div>
 
               <div class="setting-item">
                 <div class="setting-info">
@@ -849,7 +937,7 @@
 
   .preset-item.active {
     border-color: var(--accent-color);
-    background: rgba(var(--accent-rgb), 0.1);
+    background: color-mix(in srgb, var(--ui-accent) 10%, transparent);
   }
 
   .preset-name {
@@ -928,7 +1016,7 @@
 
   .shortcut-key.editing {
     border-color: var(--accent-color);
-    background: rgba(var(--accent-rgb), 0.1);
+    background: color-mix(in srgb, var(--ui-accent) 10%, transparent);
     color: var(--accent-color);
     animation: pulse 1s infinite;
   }

@@ -1,5 +1,9 @@
 import MarkdownIt from 'markdown-it';
 import { isTauri } from './platform';
+import { extractHeadings } from './headings';
+import { resolvePath } from './path';
+import { renderFormula } from './latex';
+export { extractHeadings } from './headings';
 
 // 创建 markdown-it 实例
 const md = new MarkdownIt({
@@ -25,9 +29,25 @@ function safeLanguageClass(value: string): string {
   return (value || 'text').replace(/[^\w-]/g, '-').replace(/-+/g, '-') || 'text';
 }
 
-// 任务列表（checkbox）需要 markdown-it-task-lists 插件
-// 当前未安装，移除 md.enable('checkbox') 防止 Unknown rule 异常导致 500
-// 如需任务列表支持，请安装: pnpm add markdown-it-task-lists
+md.core.ruler.after('inline', 'reader_tasks', state => {
+  for (let index = 2; index < state.tokens.length; index++) {
+    const inline = state.tokens[index];
+    if (inline.type !== 'inline' || state.tokens[index - 1].type !== 'paragraph_open'
+      || state.tokens[index - 2].type !== 'list_item_open') continue;
+    const marker = inline.content.match(/^\[([ xX])\][ \t]+/);
+    const first = inline.children?.[0];
+    if (!marker || first?.type !== 'text' || !first.content.startsWith(marker[0])) continue;
+    first.content = first.content.slice(marker[0].length);
+    const checkbox = new state.Token('reader_task_checkbox', 'input', 0);
+    checkbox.meta = { checked: marker[1].toLowerCase() === 'x' };
+    inline.children!.unshift(checkbox);
+    state.tokens[index - 2].attrJoin('class', 'task-list-item');
+  }
+});
+md.renderer.rules.reader_task_checkbox = (tokens, index) => {
+  const checked = tokens[index].meta.checked;
+  return `<input type="checkbox" class="task-list-checkbox" disabled${checked ? ' checked' : ''} aria-label="${checked ? '已完成' : '未完成'}的任务（只读）" /> `;
+};
 
 // 当前文件所在目录（用于解析相对路径图片）
 let currentFileDir = '';
@@ -69,7 +89,8 @@ export function resolveImageSrc(src: string, filePath: string | null = null): st
     return src;
   }
 
-  let absolutePath = src;
+  let absolutePath: string;
+  try { absolutePath = decodeURIComponent(src); } catch { absolutePath = src; }
   const separatorIndex = filePath
     ? Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'))
     : -1;
@@ -82,38 +103,13 @@ export function resolveImageSrc(src: string, filePath: string | null = null): st
   if (!isAbsolute && baseDirectory) {
     // 相对路径 → 拼接为绝对路径
     const sep = baseDirectory.includes('\\') ? '\\' : '/';
-    absolutePath = `${baseDirectory}${sep}${src}`;
+    absolutePath = `${baseDirectory}${sep}${absolutePath}`;
   }
 
   // 规范化路径（处理 ../ 等）
-  absolutePath = normalizePath(absolutePath);
+  absolutePath = resolvePath(absolutePath);
 
   return toAssetUrl(absolutePath);
-}
-
-/**
- * 简单的路径规范化（处理 .. 和 .）
- */
-function normalizePath(p: string): string {
-  const isWin = /^[a-zA-Z]:/.test(p);
-  const sep = p.includes('\\') ? '\\' : '/';
-  const parts = p.split(/[\\\/]/).filter(Boolean);
-  const resolved: string[] = [];
-
-  for (const part of parts) {
-    if (part === '.') continue;
-    if (part === '..') {
-      resolved.pop();
-    } else {
-      resolved.push(part);
-    }
-  }
-
-  let result = resolved.join(sep);
-  if (isWin && /^[a-zA-Z]/.test(result) && !result.includes(':')) {
-    // 保留盘符
-  }
-  return result;
 }
 
 // 自定义渲染规则
@@ -126,23 +122,22 @@ md.renderer.rules.fence = function (tokens: any[], idx: number) {
   const safeLangAttr = escapeAttributeValue(rawLang);
   const safeLangClass = safeLanguageClass(rawLang);
   const code = token.content;
+  const location = token.map ? ` data-line="${token.map[0]}" data-line-end="${token.map[1]}"` : '';
 
   // Mermaid 图表：输出占位容器，由 Preview.svelte 异步渲染
   if (lang === 'mermaid') {
-    return `<div class="mermaid-container" data-mermaid="${encodeURIComponent(code)}"></div>`;
+    return `<div class="mermaid-container reader-figure"${location} data-mermaid="${encodeURIComponent(code)}"><span role="status">图表等待渲染</span></div>`;
+  }
+  if (lang === 'chart') {
+    return `<div class="reader-chart-container reader-figure"${location} data-chart="${encodeURIComponent(code)}"><span role="status">图表等待渲染</span></div>`;
   }
 
   // LaTeX/数学块：输出占位容器，由 Preview.svelte 用 KaTeX 渲染
   if (lang === 'latex' || lang === 'math' || lang === 'tex') {
-    return `<div class="code-block">
-      <div class="code-header">
-        <span class="code-language">${safeLangText}</span>
-      </div>
-      <div class="latex-code-block" data-latex="${encodeURIComponent(code)}"></div>
-    </div>`;
+    return `<div class="reader-math-block latex-code-block"${location}>${renderFormula(code, true)}</div>`;
   }
 
-  return `<div class="code-block">
+  return `<div class="code-block"${location}>
     <div class="code-header">
       <span class="code-language">${safeLangText}</span>
       <button class="copy-button" type="button">复制</button>
@@ -171,7 +166,7 @@ md.renderer.rules.code_block = function (tokens: any[], idx: number) {
 md.renderer.rules.link_open = function (tokens: any[], idx: number, options: any, _env: any, self: any) {
   const token = tokens[idx];
   const hrefIndex = token.attrIndex('href');
-  if (hrefIndex >= 0) {
+  if (hrefIndex >= 0 && /^(https?:|mailto:)/i.test(token.attrGet('href') || '')) {
     token.attrPush(['target', '_blank']);
     token.attrPush(['rel', 'noopener noreferrer']);
   }
@@ -187,9 +182,11 @@ md.renderer.rules.paragraph_open = (tokens: any[], idx: number, options: any, _e
   return self.renderToken(tokens, idx, options);
 };
 
-md.renderer.rules.heading_open = (tokens: any[], idx: number, options: any, _env: any, self: any) => {
+md.renderer.rules.heading_open = (tokens: any[], idx: number, options: any, env: any, self: any) => {
   if (tokens[idx].map) {
     tokens[idx].attrSet('data-line', String(tokens[idx].map[0]));
+    const heading = env.headings?.find((item: { line: number }) => item.line === tokens[idx].map[0] + 1);
+    if (heading) tokens[idx].attrSet('id', heading.id);
   }
   return self.renderToken(tokens, idx, options);
 };
@@ -205,40 +202,28 @@ md.renderer.rules.image = function (tokens: any[], idx: number, _options: any, e
 };
 
 // 渲染 Markdown
-export function renderMarkdown(content: string, filePath: string | null = null): string {
+export function renderMarkdown(content: string, filePath: string | null = null, original = content, lineOffset = 0): string {
   if (!content) return '';
-  return md.render(content, { filePath });
+  return md.render(content, { filePath, lineOffset, headings: extractHeadings(original) });
 }
 
 // 渲染内联 Markdown
-export function renderInlineMarkdown(content: string): string {
+export function renderInlineMarkdown(content: string, filePath: string | null = null): string {
   if (!content) return '';
-  return md.renderInline(content);
+  return md.renderInline(content, { filePath });
 }
 
 // 提取标题（用于目录）
-export function extractHeadings(content: string): Array<{ level: number; text: string; id: string }> {
-  const headings: Array<{ level: number; text: string; id: string }> = [];
-  const lines = content.split('\n');
-
-  for (const line of lines) {
-    const match = line.match(/^(#{1,6})\s+(.+)$/);
-    if (match) {
-      const level = match[1].length;
-      const text = match[2].trim();
-      const id = text
-        .toLowerCase()
-        .replace(/\s+/g, '-')
-        .replace(/[^\w-]/g, '')
-        .replace(/-+/g, '-')
-        .replace(/^-|-$/g, '');
-
-      headings.push({ level, text, id });
+md.core.ruler.push('source_locations', state => {
+  const offset = state.env.lineOffset || 0;
+  for (const token of state.tokens) if (token.map) {
+    token.map = [token.map[0] + offset, token.map[1] + offset];
+    if (token.nesting === 1 || token.type === 'fence' || token.type === 'code_block') {
+      token.attrSet('data-line', String(token.map[0]));
+      token.attrSet('data-line-end', String(token.map[1]));
     }
   }
-
-  return headings;
-}
+});
 
 // 统计信息
 export function getMarkdownStats(content: string) {

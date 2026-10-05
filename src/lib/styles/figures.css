@@ -1,0 +1,42 @@
+.reader-figure, .cm-mermaid-widget, .cm-chart-widget {
+  position: relative; margin: 1.25em auto; min-width: 0; border: 0; border-radius: 0;
+  background: transparent; padding: 0; text-align: center;
+}
+.reader-figure-body { overflow-x: auto; padding: .3em 0; }
+.reader-figure-body svg { display: block; max-width: 100%; height: auto; margin: auto; }
+.reader-figure-body pre { text-align: left; white-space: pre-wrap; overflow-wrap: anywhere; }
+.reader-figure-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; margin-top: 4px; opacity: 0; }
+.reader-figure:hover .reader-figure-actions, .reader-figure:focus-within .reader-figure-actions { opacity: 1; }
+.reader-figure-actions button { border: 0; border-radius: 4px; padding: 4px 7px; font: 12px var(--font-ui, system-ui); color: var(--doc-text-muted); background: transparent; cursor: pointer; }
+.reader-figure-actions button:hover { background: var(--doc-code-bg); color: var(--doc-text); }
+.reader-figure button:focus-visible, .cm-math-widget:focus-visible { outline: 2px solid var(--ui-accent, #34699a); outline-offset: 2px; }
+.reader-chart-error, .mermaid-error { text-align: left; color: var(--doc-text); padding: .75em; border-left: 2px solid #b56b43; }
+.reader-chart-error pre, .mermaid-error pre { font-size: .85em; margin: .5em 0 0; }
+.reader-math-block { margin: 1em 0; }
+.reader-math-block .katex-display, .cm-math-widget .katex-display { margin: 0; padding: .25em 0; }
+.cm-math-widget.cm-inline-widget { display: inline; vertical-align: baseline; }
+.cm-math-widget.cm-block-widget { padding: .25em 0; }
+.reader-math-error { display: inline-block; max-width: 100%; }
+.reader-math-error code { display: block; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .85em; }
+.reader-math-error button { display: inline-block; margin-top: 4px; font: 12px var(--font-ui, system-ui); }
+.reader-figure-dialog {
+  width: min(1100px, calc(100vw - 48px)); height: min(800px, calc(100vh - 48px)); max-width: none; max-height: none;
+  padding: 0; border: 1px solid var(--ui-border, #dedede); border-radius: 6px; background: var(--doc-paper-bg, #fff);
+  color: var(--doc-text, #2b2b2b); box-shadow: var(--ui-shadow-popover, 0 12px 40px #0002);
+}
+.reader-figure-dialog[open] { display: flex; flex-direction: column; }
+.reader-figure-dialog::backdrop { background: #0005; }
+.reader-figure-dialog header { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--ui-border, #dedede); }
+.reader-figure-dialog h2 { margin: 0 auto 0 0; font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reader-figure-dialog button { padding: 5px 9px; border: 0; border-radius: 4px; background: var(--ui-panel, #f5f5f5); color: inherit; cursor: pointer; font: 13px var(--font-ui, system-ui); white-space: nowrap; }
+.reader-figure-dialog button:focus-visible, .reader-figure-viewport:focus-visible { outline: 2px solid var(--ui-accent, #34699a); outline-offset: -2px; }
+.reader-figure-dialog output { min-width: 4ch; text-align: center; font-size: 12px; }
+.reader-figure-viewport { flex: 1; min-height: 0; overflow: auto; padding: 24px; cursor: grab; touch-action: none; }
+.reader-figure-viewport:active { cursor: grabbing; }
+@media (hover: none) { .reader-figure-actions { opacity: 1; } }
+@media (max-width: 600px) {
+  .reader-figure-dialog { width: calc(100vw - 16px); height: calc(100vh - 16px); }
+  .reader-figure-dialog header { flex-wrap: wrap; }
+  .reader-figure-dialog h2 { flex-basis: 100%; }
+}
+@media print { .reader-figure-actions, .reader-figure-dialog { display: none !important; } }

@@ -1,6 +1,9 @@
 import { WidgetType, type EditorView } from '@codemirror/view';
 import type { FenceRange } from '../markdown-scanner';
 import { makeSourceButton } from './common';
+import { revealSource } from './common';
+import { installFigureControls } from '../../utils/figure';
+import { notify } from '../../services/interaction';
 
 export class CodeWidget extends WidgetType {
   constructor(
@@ -15,7 +18,7 @@ export class CodeWidget extends WidgetType {
     return other.item.code === this.item.code
       && other.item.language === this.item.language
       && other.theme === this.theme
-      && other.version === this.version;
+      && other.item.from === this.item.from && other.item.to === this.item.to;
   }
 
   toDOM(view: EditorView): HTMLElement {
@@ -31,9 +34,12 @@ export class CodeWidget extends WidgetType {
     copy.type = 'button';
     copy.textContent = '复制';
     copy.addEventListener('click', async () => {
-      await navigator.clipboard?.writeText(this.item.code);
-      copy.textContent = '已复制';
-      setTimeout(() => { copy.textContent = '复制'; }, 1200);
+      try {
+        await navigator.clipboard.writeText(this.item.code);
+        if (!copy.isConnected) return;
+        copy.textContent = '已复制';
+        setTimeout(() => { if (copy.isConnected) copy.textContent = '复制'; }, 1200);
+      } catch { notify('复制失败，请检查剪贴板权限或手动选择代码。'); }
     });
     actions.append(copy, makeSourceButton('编辑', view, this.item.from));
     header.append(language, actions);
@@ -41,19 +47,22 @@ export class CodeWidget extends WidgetType {
     body.className = 'cm-code-widget-body';
     body.textContent = this.item.code;
     container.append(header, body);
+    const source = view.state.doc.sliceString(this.item.from, this.item.to);
+    const current = () => container.isConnected && container.dataset.destroyed !== 'true'
+      && view.state.doc.sliceString(this.item.from, this.item.to) === source;
 
     void import('../../utils/highlight')
       .then(({ highlightCode }) => {
         return highlightCode(this.item.code, this.item.language, this.theme === 'dark' ? 'dark' : 'light');
       })
       .then(html => {
-        if (!container.isConnected) return;
+        if (!current()) return;
         body.innerHTML = html;
       })
       .catch(error => {
-        if (!container.isConnected) return;
-        body.textContent = error instanceof Error ? error.message : this.item.code;
-        body.classList.add('cm-widget-error');
+        if (!current()) return;
+        body.textContent = this.item.code;
+        body.title = error instanceof Error ? error.message : '高亮不可用，显示源码';
       });
     return container;
   }
@@ -61,6 +70,8 @@ export class CodeWidget extends WidgetType {
   get estimatedHeight(): number {
     return 160;
   }
+
+  destroy(dom: HTMLElement): void { dom.dataset.destroyed = 'true'; }
 }
 
 export class MermaidWidget extends WidgetType {
@@ -75,7 +86,7 @@ export class MermaidWidget extends WidgetType {
   eq(other: MermaidWidget): boolean {
     return other.item.code === this.item.code
       && other.theme === this.theme
-      && other.version === this.version;
+      && other.item.from === this.item.from && other.item.to === this.item.to;
   }
 
   toDOM(view: EditorView): HTMLElement {
@@ -84,7 +95,10 @@ export class MermaidWidget extends WidgetType {
     const body = document.createElement('div');
     body.className = 'cm-mermaid-widget-body';
     body.textContent = '正在渲染 Mermaid…';
-    container.append(body, makeSourceButton('编辑图表', view, this.item.from));
+    container.append(body);
+    const source = view.state.doc.sliceString(this.item.from, this.item.to);
+    const current = () => container.isConnected && container.dataset.destroyed !== 'true'
+      && view.state.doc.sliceString(this.item.from, this.item.to) === source;
 
     void import('../../utils/mermaid')
       .then(({ renderMermaid }) => renderMermaid(
@@ -92,16 +106,19 @@ export class MermaidWidget extends WidgetType {
         this.theme === 'dark' ? 'dark' : 'light',
       ))
       .then(svg => {
-        if (!container.isConnected) return;
-        body.innerHTML = svg;
+        if (!current()) return;
+        container.innerHTML = svg;
+        installFigureControls(container, { title: 'Mermaid 图表', source: this.item.code,
+          edit: () => revealSource(view, this.item.from) });
         if (svg.includes('mermaid-error')) {
-          body.className += ' cm-widget-error';
+          container.querySelector('.mermaid-error')?.classList.add('cm-widget-error');
         }
       })
       .catch(error => {
-        if (!container.isConnected) return;
+        if (!current()) return;
         body.className += ' cm-widget-error';
         body.textContent = error instanceof Error ? error.message : 'Mermaid 渲染失败';
+        container.append(makeSourceButton('编辑图表', view, this.item.from));
       });
     return container;
   }
@@ -109,4 +126,41 @@ export class MermaidWidget extends WidgetType {
   get estimatedHeight(): number {
     return 220;
   }
+
+  destroy(dom: HTMLElement): void { dom.dataset.destroyed = 'true'; }
+}
+
+export class ChartWidget extends WidgetType {
+  constructor(readonly item: FenceRange, readonly theme: 'light' | 'dark') { super(); }
+
+  eq(other: ChartWidget): boolean {
+    return other.item.code === this.item.code && other.theme === this.theme
+      && other.item.from === this.item.from && other.item.to === this.item.to;
+  }
+
+  toDOM(view: EditorView): HTMLElement {
+    const container = document.createElement('div');
+    container.className = 'cm-chart-widget cm-block-widget';
+    container.textContent = '图表正在渲染';
+    const source = view.state.doc.sliceString(this.item.from, this.item.to);
+    const current = () => container.isConnected && container.dataset.destroyed !== 'true'
+      && view.state.doc.sliceString(this.item.from, this.item.to) === source;
+    void import('../../utils/data-chart').then(({ renderDataChart, renderChartTable, renderChartError, parseDataChart }) => {
+      if (!current()) return;
+      let title = '数据图表';
+      let valid = false;
+      try { title = parseDataChart(this.item.code).title; container.innerHTML = renderDataChart(this.item.code, this.theme); valid = true; }
+      catch (error) { container.innerHTML = renderChartError(this.item.code, error); }
+      installFigureControls(container, { title, source: this.item.code,
+        edit: () => revealSource(view, this.item.from), table: valid ? () => renderChartTable(this.item.code) : undefined });
+    }).catch(() => {
+      if (!current()) return;
+      container.textContent = '图表加载失败';
+      container.append(makeSourceButton('编辑图表', view, this.item.from));
+    });
+    return container;
+  }
+
+  destroy(dom: HTMLElement): void { dom.dataset.destroyed = 'true'; }
+  get estimatedHeight(): number { return 420; }
 }

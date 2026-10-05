@@ -228,6 +228,9 @@ importers:
       '@codemirror/view':
         specifier: ^6.0.0
         version: 6.43.0
+      '@lezer/highlight':
+        specifier: ^1.2.3
+        version: 1.2.3
       '@tauri-apps/plugin-dialog':
         specifier: ^2.7.1
         version: 2.7.1

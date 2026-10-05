@@ -1,22 +1,29 @@
 /* UI 层面设计令牌 (Application Chrome) */
 :root {
-  --ui-bg: #f7f7f7;
-  --ui-panel: #f1f1f1;
-  --ui-panel-hover: #e8e8e8;
+  color-scheme: light;
+  --ui-bg: #fcfcfc;
+  --ui-panel: #f7f7f7;
+  --ui-panel-hover: #ededed;
   --ui-panel-active: #ffffff;
   --ui-border: #e1e1e1;
   --ui-text: #333333;
-  --ui-text-muted: #858585;
+  --ui-text-muted: #737373;
   --ui-accent: #4f78c4;
   --ui-focus-ring: rgba(79, 120, 196, 0.3);
   --ui-shadow-popover: 0 6px 18px rgba(0, 0, 0, 0.11), 0 0 0 1px rgba(0, 0, 0, 0.045);
 
-  --font-ui: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-  --font-content: "Source Serif 4", "Noto Serif SC", "Source Han Serif SC", "Songti SC", serif;
-  --font-mono: "JetBrains Mono", "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  --font-ui: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-content: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", "SFMono-Regular", Consolas, "Noto Sans Mono CJK SC", "Microsoft YaHei", monospace;
+  --syntax-muted: #737373;
+  --syntax-accent: #365f96;
+  --syntax-string: #39734c;
+  --syntax-literal: #925c32;
+  --syntax-error: #b13a3a;
 }
 
 [data-theme="dark"] {
+  color-scheme: dark;
   --ui-bg: #202020;
   --ui-panel: #252525;
   --ui-panel-hover: #2f2f2f;
@@ -27,4 +34,9 @@
   --ui-accent: #6e9eea;
   --ui-focus-ring: rgba(110, 158, 234, 0.3);
   --ui-shadow-popover: 0 4px 12px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  --syntax-muted: #a0a0a0;
+  --syntax-accent: #7ba9e2;
+  --syntax-string: #94bc99;
+  --syntax-literal: #d0b58a;
+  --syntax-error: #ed9191;
 }
